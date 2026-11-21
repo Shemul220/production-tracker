@@ -274,38 +274,146 @@ ACH_CFG = {"Achievement %": st.column_config.ProgressColumn(
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1.2rem; max-width: 1250px;}
+:root {
+    color-scheme: light !important;
+    --bsu-navy: #123B5D;
+    --bsu-blue: #1F77D0;
+    --bsu-teal: #087F70;
+    --bsu-bg: #F3F6FA;
+    --bsu-text: #1E293B;
+}
+html, body, [data-testid="stAppViewContainer"], .stApp {
+    background: #F3F6FA !important;
+    color: #1E293B !important;
+}
+[data-testid="stHeader"] {
+    background: rgba(243,246,250,.96) !important;
+}
+[data-testid="stMain"] {
+    background: #F3F6FA !important;
+}
+.block-container {
+    padding-top: 1.35rem !important;
+    padding-bottom: 2rem !important;
+    max-width: 1450px !important;
+}
+[data-testid="stSidebar"] {
+    background: #EAF0F7 !important;
+    border-right: 1px solid #D8E2EE !important;
+}
+[data-testid="stSidebar"] * {
+    color: #18324B;
+}
 footer {visibility: hidden;}
-.hero {background: linear-gradient(120deg,#0B3C6F 0%,#1F77D0 55%,#19B5A5 100%); color:#fff;
-       padding: 22px 26px; border-radius: 18px; margin-bottom: 14px;
-       box-shadow: 0 6px 18px rgba(31,119,208,.28);}
-.hero-t {font-size: 1.8rem; font-weight: 800; letter-spacing: .3px;}
-.hero-s {opacity: .92; font-size: .95rem; margin-top: 4px;}
-.kpi {color:#fff; padding: 16px 18px; border-radius: 16px; box-shadow: 0 4px 14px rgba(0,0,0,.18);
-      margin-bottom: 10px; min-height: 108px;}
-.kpi-l {font-size: .78rem; opacity: .95; font-weight: 700; text-transform: uppercase; letter-spacing: .7px;}
-.kpi-v {font-size: 1.7rem; font-weight: 800; margin-top: 4px; line-height: 1.15;}
-.kpi-s {font-size: .8rem; opacity: .92; margin-top: 3px;}
-.sec {font-size: 1.08rem; font-weight: 700; margin: 20px 0 6px 0; padding-left: 10px;
-      border-left: 5px solid #FF8C42;}
-div[data-baseweb="tab-list"] {gap: 6px;}
-button[data-baseweb="tab"] {font-weight: 600; padding: 8px 14px;}
+.hero {
+    background: linear-gradient(120deg,#123B5D 0%,#1F77D0 58%,#087F70 100%);
+    color: #FFFFFF !important;
+    padding: 24px 28px;
+    border-radius: 18px;
+    margin: 8px 0 20px 0;
+    box-shadow: 0 8px 24px rgba(18,59,93,.18);
+}
+.hero-t {font-size: clamp(1.35rem, 3vw, 2rem); font-weight: 800; letter-spacing: .2px;}
+.hero-s {color:#EAF6FF !important; font-size:.95rem; margin-top:5px;}
+.kpi {
+    color:#FFFFFF !important;
+    padding: 18px 18px;
+    border-radius: 16px;
+    box-shadow: 0 5px 16px rgba(15,45,75,.13);
+    margin-bottom: 12px;
+    min-height: 112px;
+}
+.kpi * {color:#FFFFFF !important;}
+.kpi-l {font-size:.78rem; opacity:.96; font-weight:700; letter-spacing:.45px;}
+.kpi-v {font-size:clamp(1.25rem,2.4vw,1.85rem); font-weight:800; margin-top:7px; line-height:1.2; overflow-wrap:anywhere;}
+.kpi-s {font-size:.8rem; opacity:.92; margin-top:5px;}
+.sec {
+    color:#123B5D !important;
+    font-size:1.12rem;
+    font-weight:800;
+    margin:24px 0 10px 0;
+    padding:8px 0 8px 12px;
+    border-left:5px solid #F4A340;
+    background:linear-gradient(90deg,#E8F1FA,rgba(232,241,250,0));
+    border-radius:0 8px 8px 0;
+}
+h1,h2,h3,h4,p,label,[data-testid="stMarkdownContainer"] {
+    color:#1E293B;
+}
+div[data-baseweb="tab-list"] {
+    gap:7px;
+    background:#E7EEF6;
+    padding:7px;
+    border-radius:13px;
+}
+button[data-baseweb="tab"] {
+    color:#23415C !important;
+    font-weight:700 !important;
+    border-radius:9px !important;
+    padding:9px 15px !important;
+}
+button[data-baseweb="tab"][aria-selected="true"] {
+    background:#123B5D !important;
+    color:#FFFFFF !important;
+}
+div[data-baseweb="select"] > div,
+div[data-baseweb="input"] > div,
+div[data-baseweb="textarea"] > div {
+    background:#FFFFFF !important;
+    border:1px solid #CBD5E1 !important;
+    border-radius:10px !important;
+}
+div[data-baseweb="select"] *,
+div[data-baseweb="input"] *,
+div[data-baseweb="textarea"] * {
+    color:#1E293B !important;
+}
+.stButton > button, div[data-testid="stFormSubmitButton"] > button {
+    background:linear-gradient(100deg,#123B5D,#1F77D0) !important;
+    color:#FFFFFF !important;
+    border:0 !important;
+    border-radius:10px !important;
+    font-weight:700 !important;
+    padding:.55rem 1rem !important;
+}
+.stButton > button:hover, div[data-testid="stFormSubmitButton"] > button:hover {
+    background:#087F70 !important;
+    color:#FFFFFF !important;
+}
+[data-testid="stDataFrame"], [data-testid="stTable"] {
+    background:#FFFFFF !important;
+    border:1px solid #DCE5EF !important;
+    border-radius:12px !important;
+}
+[data-testid="stMetric"] {
+    background:#FFFFFF;
+    border:1px solid #E0E8F0;
+    padding:14px;
+    border-radius:13px;
+    box-shadow:0 3px 10px rgba(15,45,75,.05);
+}
+@media (max-width: 700px) {
+    .block-container {padding: .8rem .75rem 1.5rem .75rem !important;}
+    .hero {padding:18px 16px; border-radius:14px;}
+    .kpi {padding:13px 12px; min-height:100px; border-radius:13px;}
+    .kpi-v {font-size:1.25rem;}
+    div[data-baseweb="tab-list"] {overflow-x:auto; flex-wrap:nowrap;}
+    button[data-baseweb="tab"] {white-space:nowrap; padding:8px 10px !important;}
+}
 </style>
 """, unsafe_allow_html=True)
 
 
 def theme_type():
-    try:
-        return st.context.theme.type or "light"
-    except Exception:  # noqa: BLE001
-        return "light"
+    # The deployed application is intentionally locked to a light theme.
+    return "light"
 
 
 def style(fig, h=370):
-    fc = "#E8EEF7" if theme_type() == "dark" else "#1B2A41"
+    fc = "#1E293B"
     grid = "rgba(150,160,180,.25)"
-    fig.update_layout(height=h, margin=dict(l=8, r=8, t=44, b=8), paper_bgcolor="rgba(0,0,0,0)",
-                      plot_bgcolor="rgba(0,0,0,0)", font=dict(color=fc, size=12), colorway=PALETTE,
+    fig.update_layout(height=h, margin=dict(l=8, r=8, t=44, b=8), paper_bgcolor="#FFFFFF",
+                      plot_bgcolor="#FFFFFF", font=dict(color=fc, size=12), colorway=PALETTE,
                       legend=dict(orientation="h", y=-0.18, x=0), title_font=dict(size=15))
     fig.update_xaxes(gridcolor=grid, zeroline=False)
     fig.update_yaxes(gridcolor=grid, zeroline=False)
