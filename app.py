@@ -27,7 +27,7 @@ TARGET_COLS = ["Date", "Daily Target", "Daily Output"]
 BATCH_COLS = ["Date", "Product Name", "Batch No", "Type"]
 
 # মাসিক Target (মাস → সংখ্যা)। এখানে দেওয়া মান ডিফল্ট; সাইট থেকে বদলালে data/monthly_targets.json-এ সেভ হয়।
-DEFAULT_MONTHLY_TARGETS = {"2026-11": 17830000}  # নভেম্বর'26 = 1,78,30,000
+DEFAULT_MONTHLY_TARGETS = {"2026-11": 178300000}  # নভেম্বর'26 = 1,78,30,000
 MT_FILE = DATA_DIR / "monthly_targets.json"
 
 # লগবুক ফাইলের কলামের অবস্থান (০ থেকে গোনা)। নতুন কলাম লাগলে এখানে যোগ করুন।
