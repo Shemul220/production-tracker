@@ -1,6 +1,7 @@
 import base64
 import hmac
 import io
+import json
 import re
 from urllib.parse import quote
 from datetime import date, datetime, time, timedelta
@@ -24,6 +25,10 @@ PROD_COLS = ["Stage", "Date", "Day", "Shift", "Shift Owner", "Line", "Code", "Ba
              "Output", "Hours", "Std Capacity", "Actual Capacity", "Down Time", "Remarks"]
 TARGET_COLS = ["Date", "Daily Target", "Daily Output"]
 BATCH_COLS = ["Date", "Product Name", "Batch No", "Type"]
+
+# মাসিক Target (মাস → সংখ্যা)। এখানে দেওয়া মান ডিফল্ট; সাইট থেকে বদলালে data/monthly_targets.json-এ সেভ হয়।
+DEFAULT_MONTHLY_TARGETS = {"2026-11": 17830000}  # নভেম্বর'26 = 1,78,30,000
+MT_FILE = DATA_DIR / "monthly_targets.json"
 
 # লগবুক ফাইলের কলামের অবস্থান (০ থেকে গোনা)। নতুন কলাম লাগলে এখানে যোগ করুন।
 SECONDARY_MAP = {0: "Date", 1: "Day", 2: "Shift", 3: "Shift Owner", 4: "Line", 5: "Code",
@@ -172,9 +177,119 @@ def parse_batches(wb, hdr, names):
     return recs
 
 
+EXPORT_COLS = ["Source", "Sheet", "Country", "SAP Code", "Order No", "Machine", "Product Name", "Pack Size",
+               "Required Box", "Required Pcs", "Batch Size", "Batches Req", "Batch Number", "Status",
+               "Order Date", "Completed Date", "Delivery Date", "Remarks"]
+
+
+def to_ddmmyy(v):
+    """'25.03.26' বা আসল তারিখ → datetime (না পারলে None)।"""
+    d = to_date(v)
+    if d:
+        return d
+    s = txt(v)
+    if s:
+        m = re.match(r"^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$", s)
+        if m:
+            dd, mm, yy = int(m[1]), int(m[2]), int(m[3])
+            yy += 2000 if yy < 100 else 0
+            try:
+                return datetime(yy, mm, dd)
+            except ValueError:
+                return None
+    return None
+
+
+COUNTRY_FIX = {"keneya": "Kenya", "sri-lanka": "Sri Lanka", "sri lanka": "Sri Lanka", "srilanka": "Sri Lanka"}
+
+
+def clean_country(v):
+    s = txt(v)
+    return COUNTRY_FIX.get(s.lower(), s) if s else s
+
+
+def _country(r):
+    """দেশের নামের সারি কিনা (শুধু নাম আছে, অর্ডার নম্বর নেই)।"""
+    return (len(r) > 2 and r[0] is None and isinstance(r[1], str) and r[1].strip()
+            and r[2] is None and not r[1].strip().lower().startswith("total"))
+
+
+def parse_export(wb):
+    """Export Order Status ফাইল: Open order, চলতি মাসের Completed, আর Demand শিট।"""
+    recs, done_sheet = [], False
+    for ws in wb.worksheets:
+        title = (ws.title or "").strip()
+        low = title.lower()
+        rows = list(ws.iter_rows(min_row=1, max_row=120, max_col=21, values_only=True))
+        rows = [tuple(r) + (None,) * (21 - len(r)) for r in rows]
+        if low.startswith("current export order"):          # চলমান অর্ডার
+            ctry = None
+            for r in rows:
+                if _country(r):
+                    ctry = clean_country(r[1])
+                    continue
+                if not isinstance(r[2], (int, float)) or isinstance(r[4], (int, float)) or txt(r[4]) is None:
+                    continue
+                recs.append(dict(Source="Open", Sheet=title, Country=ctry, **{
+                    "SAP Code": txt(r[1]), "Order No": txt(r[2]), "Machine": txt(r[3]),
+                    "Product Name": txt(r[4]), "Pack Size": txt(r[5]), "Required Box": num(r[7]),
+                    "Required Pcs": num(r[8]), "Batch Size": num(r[9]), "Batches Req": num(r[10]),
+                    "Batch Number": txt(r[11]), "Status": txt(r[12]), "Order Date": to_ddmmyy(r[13]),
+                    "Completed Date": to_ddmmyy(r[18]), "Delivery Date": to_ddmmyy(r[14]),
+                    "Remarks": txt(r[19])}))
+        elif low.startswith("completed (") and not done_sheet:   # শুধু সবচেয়ে নতুন Completed শিট
+            done_sheet, ctry = True, None
+            for r in rows:
+                if _country(r):
+                    ctry = clean_country(r[1])
+                    continue
+                if not isinstance(r[2], (int, float)) or not isinstance(r[3], str):
+                    continue
+                o = 0 if any(ch.isdigit() for ch in r[3]) else 1   # মেশিনের নাম থাকলে এক কলাম সরে যায়
+                recs.append(dict(Source="Completed", Sheet=title, Country=ctry, **{
+                    "SAP Code": txt(r[1]), "Order No": txt(r[2]), "Machine": txt(r[3]) if o else None,
+                    "Product Name": txt(r[3 + o]), "Pack Size": txt(r[4 + o]), "Required Box": num(r[6 + o]),
+                    "Required Pcs": num(r[7 + o]), "Batch Size": num(r[8 + o]), "Batches Req": num(r[9 + o]),
+                    "Batch Number": txt(r[10 + o]), "Status": txt(r[11 + o]),
+                    "Order Date": to_ddmmyy(r[12 + o]), "Completed Date": to_ddmmyy(r[13 + o]),
+                    "Delivery Date": to_ddmmyy(r[14 + o]), "Remarks": None}))
+        elif rows and isinstance(rows[0][0], str) and rows[0][0].strip().lower().startswith("export order"):
+            hdr = [str(c).strip().lower() if c is not None else "" for c in rows[1]]
+            if len(hdr) < 9 or "sales document" not in hdr[1] or "qty" not in hdr[4]:
+                continue
+            unit = "Box" if "box" in hdr[4] else "Pcs"
+            label = rows[0][0].strip()[len("export order"):].strip()
+            ctry = None
+            for r in rows[2:]:
+                if txt(r[0]):
+                    ctry = clean_country(r[0])
+                if not isinstance(r[1], (int, float)) or txt(r[2]) is None:
+                    continue
+                recs.append(dict(Source="Demand", Sheet=label, Country=ctry, **{
+                    "SAP Code": txt(r[3]), "Order No": txt(r[1]), "Machine": None,
+                    "Product Name": txt(r[2]), "Pack Size": unit,
+                    "Required Box": num(r[4]) if unit == "Box" else None,
+                    "Required Pcs": num(r[4]) if unit == "Pcs" else None,
+                    "Batch Size": None, "Batches Req": None, "Batch Number": None, "Status": txt(r[8]),
+                    "Order Date": to_ddmmyy(r[5]), "Completed Date": None,
+                    "Delivery Date": to_ddmmyy(r[6]), "Remarks": None}))
+    return recs
+
+
+def status_group(s):
+    t = (s or "").lower()
+    for key, name in (("complete", "Completed"), ("hold", "Hold"), ("need to take", "Batch need to take"),
+                      ("running", "Packing running"), ("blister", "Ready for Blister"),
+                      ("compress", "Ready for Compression"), ("granul", "Ready for Granulation"),
+                      ("coating", "Ready for Coating"), ("packing", "Ready for Packing")):
+        if key in t:
+            return name
+    return "Other" if t else "Unknown"
+
+
 @st.cache_data(show_spinner="ফাইল পড়া হচ্ছে...")
 def load_files(files):
-    prod, tgt, bat, errors = [], [], [], []
+    prod, tgt, bat, exp, errors = [], [], [], [], []
     for name, data in files:
         try:
             wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
@@ -185,6 +300,11 @@ def load_files(files):
                     tgt.append(x.parse("Daily Target").reindex(columns=TARGET_COLS))
                 if "Batch Release" in x.sheet_names:
                     bat.append(x.parse("Batch Release").reindex(columns=BATCH_COLS))
+                if "Export Orders" in x.sheet_names:
+                    exp.append(x.parse("Export Orders").reindex(columns=EXPORT_COLS))
+                continue
+            if any(n.strip().lower().startswith("current export order") for n in wb.sheetnames):
+                exp.append(pd.DataFrame(parse_export(wb), columns=EXPORT_COLS))  # Export Order Status ফাইল
                 continue
             t = parse_targets(wb)
             if t:
@@ -205,7 +325,9 @@ def load_files(files):
     P, T, B = cat(prod, PROD_COLS).drop_duplicates(), cat(tgt, TARGET_COLS), cat(bat, BATCH_COLS)
     T = T.drop_duplicates("Date", keep="last") if len(T) else T
     B = B.drop_duplicates(["Date", "Batch No", "Product Name"]) if len(B) else B
-    return {"prod": P, "tgt": T, "bat": B}, errors
+    # একাধিক Export ফাইল থাকলে সবচেয়ে শেষেরটা (নতুন আপলোড) নেওয়া হয়, যাতে পুরনো/নতুন ভার্সন দ্বিগুণ না হয়
+    X = exp[-1] if exp else pd.DataFrame(columns=EXPORT_COLS)
+    return {"prod": P, "tgt": T, "bat": B, "exp": X}, errors
 
 
 # ---------- হিসাব ----------
@@ -400,6 +522,17 @@ def fmt(n):
     return f"{n:,.0f}"
 
 
+def fmt_full(n):
+    """পুরো সংখ্যা, বাংলাদেশি/ভারতীয় কমা-সহ: 1520000 → 15,20,000; 15200000 → 1,52,00,000।"""
+    if n is None or pd.isna(n):
+        return "-"
+    n = int(round(float(n)))
+    s = str(abs(n))
+    if len(s) > 3:
+        s = re.sub(r"(\d)(?=(\d\d)+$)", r"\1,", s[:-3]) + "," + s[-3:]
+    return ("-" if n < 0 else "") + s
+
+
 def kpi(col, label, value, sub="", g=0):
     col.markdown(f'<div class="kpi" style="--ac:{ACCENTS[g % 4]}"><div class="kpi-l">{label}</div>'
                  f'<div class="kpi-v">{value}</div><div class="kpi-s">{sub}</div></div>',
@@ -488,6 +621,41 @@ def gh_put(path, data, message):
 # সাইডবার ও ডেটা লোড
 # =====================================================================
 MANUAL_FILE = DATA_DIR / "manual_entries.xlsx"
+
+
+def autosave_on():
+    return gh_ready() and st.session_state.get("autosave", True)
+
+
+def manual_bytes(df):
+    mb, mx = io.BytesIO(), df.copy()
+    mx["Date"] = pd.to_datetime(mx["Date"], errors="coerce").dt.date
+    mx.to_excel(mb, sheet_name="Production", index=False)
+    return mb.getvalue()
+
+
+def save_manual_now():
+    """হাতে দেওয়া এন্ট্রি বদলালেই নিজে থেকে GitHub-এ সেভ (অটো-সেভ চালু থাকলে)।"""
+    if autosave_on():
+        try:
+            gh_put(f"data/{MANUAL_FILE.name}", manual_bytes(st.session_state.manual), "Update manual entries")
+            st.session_state.flash = ("ok", "✅ এন্ট্রি নিজে থেকে সেভ হয়েছে। ১-২ মিনিটে সাইট আপডেট হবে।")
+        except Exception as e:  # noqa: BLE001
+            st.session_state.flash = ("err", f"সেভ হয়নি: {e}")
+
+
+def save_mt():
+    """মাসিক Target সেভ: GitHub থাকলে সেখানে, না থাকলে ডাউনলোডের ব্যবস্থা।"""
+    data = json.dumps(st.session_state.mt_raw, ensure_ascii=False, indent=1).encode("utf-8")
+    if autosave_on():
+        try:
+            gh_put(f"data/{MT_FILE.name}", data, "Update monthly targets")
+            st.session_state.flash = ("ok", "✅ Target সেভ হয়েছে।")
+        except Exception as e:  # noqa: BLE001
+            st.session_state.flash = ("err", f"Target সেভ হয়নি: {e}")
+    else:
+        st.session_state.flash = ("ok", "Target বসানো হয়েছে (এই সেশনে)। স্থায়ী করতে 'Data' ট্যাব থেকে monthly_targets.json "
+                                        "নামিয়ে GitHub-এর data ফোল্ডারে দিন।")
 uploads = []
 with st.sidebar:
     st.markdown("### 🏭 BSU Tracker")
@@ -500,9 +668,22 @@ with st.sidebar:
         st.warning("Login চালু নেই। Streamlit Secrets-এ admin/viewer দিলে চালু হবে।")
     if is_admin:
         st.markdown("#### 📁 ডেটা ফাইল")
+        if gh_ready():
+            st.checkbox("🔄 নিজে থেকে সেভ (GitHub)", value=True, key="autosave")
         uploads = st.file_uploader("Excel ফাইল (একাধিক দেওয়া যায়)", type=["xlsx"],
                                    accept_multiple_files=True)
-        if uploads:
+        if uploads and autosave_on():
+            saved = st.session_state.setdefault("saved_uploads", {})
+            for up in uploads:
+                if (up.name, up.size) not in saved:
+                    try:
+                        gh_put(f"data/{up.name}", up.getvalue(), f"Add {up.name}")
+                        saved[(up.name, up.size)] = True
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"{up.name}: {e}")
+            if saved:
+                st.caption("✅ সেভ হয়েছে: " + ", ".join(n for n, _ in saved))
+        elif uploads:
             if gh_ready():
                 if st.button("💾 স্থায়ীভাবে সেভ করুন"):
                     done, bad = [], []
@@ -520,8 +701,9 @@ with st.sidebar:
                 st.caption("স্থায়ী করতে ফাইলগুলো GitHub-এর data ফোল্ডারে আপলোড করুন "
                            "(বা Secrets-এ github token দিন)।")
 
-repo_paths = [p for p in sorted(DATA_DIR.glob("*.xlsx"))
-              if not p.name.startswith("~$") and p.name != MANUAL_FILE.name] if DATA_DIR.exists() else []
+repo_paths = [p for p in sorted(DATA_DIR.iterdir())  # .xlsx আর .XLSX দুটোই পড়বে
+              if p.suffix.lower() == ".xlsx" and not p.name.startswith("~$")
+              and p.name != MANUAL_FILE.name] if DATA_DIR.exists() else []
 if DEFAULT_FILE.exists():
     repo_paths.append(DEFAULT_FILE)
 files = tuple([(p.name, p.read_bytes()) for p in repo_paths] + [(u.name, u.getvalue()) for u in uploads])
@@ -547,6 +729,16 @@ frames = [f for f in (D["prod"], st.session_state.manual) if len(f)]
 prod = prep_prod(pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=PROD_COLS))
 tgt, bat = prep_tgt(D["tgt"]), prep_bat(D["bat"])
 
+if "mt_raw" not in st.session_state:
+    raw = dict(DEFAULT_MONTHLY_TARGETS)
+    try:
+        if MT_FILE.exists():
+            raw.update({str(k): int(v) for k, v in json.loads(MT_FILE.read_text("utf-8")).items()})
+    except Exception:  # noqa: BLE001
+        pass
+    st.session_state.mt_raw = raw
+MT = {k: v for k, v in st.session_state.mt_raw.items() if v and v > 0}  # মাস → মাসিক Target
+
 def _span(df, label):
     if df.empty:
         return None
@@ -555,12 +747,15 @@ def _span(df, label):
 
 hero("Primary &amp; Secondary Packaging · Daily Target vs Output · Batch Release",
      [c for c in (_span(prod, "📊 Production"), _span(tgt, "🎯 Target"), _span(bat, "📦 Batch")) if c])
+fl = st.session_state.pop("flash", None)
+if fl:
+    (st.success if fl[0] == "ok" else st.error)(fl[1])
 st.toggle("🖱️ চার্ট জুম/মুভ চালু করুন (স্ক্রল করার সময় বন্ধ রাখুন)", key="chart_edit")
-labels = ["📊 Production", "📋 Daily Report", "🎯 Target vs Output", "📦 Batch Release"]
+labels = ["📊 Production", "📋 Daily Report", "🎯 Target vs Output", "📦 Batch Release", "🚢 Export Order"]
 if is_admin:
     labels += ["➕ নতুন এন্ট্রি", "🗂️ ডেটা"]
 tabs = st.tabs(labels)
-t1, t_dr, t2, t3 = tabs[0], tabs[1], tabs[2], tabs[3]
+t1, t_dr, t2, t3, t_ex = tabs[0], tabs[1], tabs[2], tabs[3], tabs[4]
 
 # =====================================================================
 # Production
@@ -571,6 +766,9 @@ with t1:
     else:
         sel = st.radio("ধাপ", ["সব", "Primary", "Secondary"], horizontal=True)
         base = prod if sel == "সব" else prod[prod["Stage"] == sel]
+        if sel == "সব":
+            st.caption("⚠️ 'সব' দিলে Primary + Secondary Output যোগ হয়: একই প্রোডাক্ট দুই ধাপে গোনা হয়ে মোট অনেক "
+                       "বেশি দেখাতে পারে। কারখানার প্রকৃত মোট Output দেখতে একটা ধাপ বেছে নিন।")
         months = sorted(base["Month"].unique())
         pick = st.selectbox("মাস", ["সব মাস"] + months, index=len(months))
         view = base if pick == "সব মাস" else base[base["Month"] == pick]
@@ -578,10 +776,10 @@ with t1:
         ach = achievement(view)
         hrs = view["Hours"].sum()
         k = st.columns(4)
-        kpi(k[0], "মোট Output", fmt(view["Output"].sum()), f"{len(view)} এন্ট্রি", 0)
+        kpi(k[0], "মোট Output", fmt_full(view["Output"].sum()), f"{len(view)} এন্ট্রি", 0)
         kpi(k[1], "চলার সময়", f"{hrs:,.0f} ঘণ্টা", f"{view['Date'].nunique()} দিন", 1)
         kpi(k[2], "Achievement", f"{ach:.1f}%" if ach is not None else "-", f"{sel} · {pick}", 2)
-        kpi(k[3], "Output / ঘণ্টা", fmt(view["Output"].sum() / hrs) if hrs > 0 else "-", "গড়", 3)
+        kpi(k[3], "Output / ঘণ্টা", fmt_full(view["Output"].sum() / hrs) if hrs > 0 else "-", "গড়", 3)
 
         sec_title("মাসিক Output ও চলার সময়")
         mo = base.groupby(["Month", "Stage"], as_index=False).agg(Output=("Output", "sum"), Hours=("Hours", "sum"))
@@ -665,7 +863,7 @@ with t_dr:
             kpi(k[0], "রান / এন্ট্রি", f"{len(v):,}", f"{v['Date'].nunique()} দিন", 0)
             kpi(k[1], "Batch সংখ্যা", f"{nb(v['Batch No'])}", "আলাদা Batch No", 1)
             kpi(k[2], "Product", f"{v['Product Name'].nunique()}", "আলাদা Product", 2)
-            kpi(k[3], "মোট Output", fmt(v["Output"].sum()), f"{v['Hours'].sum():,.1f} ঘণ্টা", 3)
+            kpi(k[3], "মোট Output", fmt_full(v["Output"].sum()), f"{v['Hours'].sum():,.1f} ঘণ্টা", 3)
 
             sec_title("দৈনিক রিপোর্ট (Batch, Start ও End সময়সহ)")
             rt = run_table(v)
@@ -709,20 +907,80 @@ with t2:
         st.info("Daily output reporting ফাইলটা (Daily Target Output Achievement শিটসহ) আপলোড করুন।")
     else:
         valid = tgt[tgt["Daily Target"].notna() & tgt["Daily Output"].notna()]
-        tt, oo = valid["Daily Target"].sum(), valid["Daily Output"].sum()
+
+        # ---------- মাস বেছে নিন: নিচের সব KPI এই মাসের ----------
+        all_m = sorted(set(tgt["Month"]) | set(MT))
+        last_m = sorted(tgt["Month"].unique())[-1]
+        tm = st.selectbox("মাস", all_m, index=all_m.index(last_m), key="tm")
+        dd = tgt[tgt["Month"] == tm]
+        mv = valid[valid["Month"] == tm]
+        out_m = float(dd["Daily Output"].sum())          # এই মাসের মোট Output (সব দিন, Target না থাকা দিনসহ)
+        mt_val = MT.get(tm)                              # মাসিক Target (সেট করা)
+        day_t = float(mv["Daily Target"].sum())          # দৈনিক Target-এর যোগফল (বিকল্প)
+        used_t = mt_val or day_t or None
+        ach_m = out_m / used_t * 100 if used_t else None
+
+        sec_title(f"{tm} · মাসিক Target বনাম Output")
         k = st.columns(4)
-        kpi(k[0], "মোট Output", fmt(tgt["Daily Output"].sum()), "সব দিন", 0)
-        kpi(k[1], "মোট Target", fmt(tt), "Target-যুক্ত দিন", 1)
-        kpi(k[2], "Achievement", f"{oo / tt * 100:.1f}%" if tt else "-", "Output ÷ Target", 2)
-        kpi(k[3], "দিন", f"{len(valid)}", "Target-যুক্ত দিন", 3)
+        kpi(k[0], "মোট Output", fmt_full(out_m), f"{dd['Daily Output'].gt(0).sum()} দিনে", 0)
+        if mt_val:
+            kpi(k[1], "মাসিক Target", fmt_full(mt_val), "সেট করা Target", 1)
+        else:
+            kpi(k[1], "Target", fmt_full(day_t) if day_t else "-",
+                "দৈনিক Target-এর যোগফল (মাসিক Target সেট নেই)" if day_t else "নিচে থেকে Target সেট করুন", 1)
+        kpi(k[2], "Achievement", f"{ach_m:.1f}%" if ach_m is not None else "-", "Output ÷ Target", 2)
+        if used_t:
+            kpi(k[3], "বাকি" if out_m < used_t else "Target ছাড়িয়েছে",
+                fmt_full(abs(used_t - out_m)), "Target পূরণে লাগবে" if out_m < used_t else "অতিরিক্ত Output", 3)
+        else:
+            kpi(k[3], "বাকি", "-", "", 3)
+        if ach_m is not None:
+            st.progress(min(max(ach_m / 100, 0.0), 1.0))
 
-        mon = tgt.groupby("Month").agg(Total_Output=("Daily Output", "sum"))
-        vm = valid.groupby("Month").agg(Output=("Daily Output", "sum"), Target=("Daily Target", "sum"),
-                                        Days=("Date", "count"))
+        worked = dd[dd["Daily Output"].fillna(0) > 0]
+        if used_t and len(worked):
+            n_work = len(worked)
+            avg_d = out_m / n_work
+            last_d = worked["Date"].max()
+            m_end = pd.Period(tm, freq="M").end_time.normalize()
+            rem_days = sum(1 for d in pd.date_range(last_d + pd.Timedelta(days=1), m_end) if d.weekday() != 4)
+            need = max(used_t - out_m, 0)
+            proj = out_m + avg_d * rem_days
+            k2 = st.columns(4)
+            kpi(k2[0], "দিনপ্রতি গড় Output", fmt_full(avg_d), f"{n_work} কর্মদিবসের গড়", 0)
+            kpi(k2[1], "বাকি কর্মদিবস", f"{rem_days}", f"{last_d:%d %b}-এর পর, শুক্রবার বাদ", 1)
+            kpi(k2[2], "দিনে লাগবে", fmt_full(need / rem_days) if rem_days and need > 0 else "-",
+                "Target ধরতে বাকি দিনগুলোতে" if need > 0 else "Target পূরণ হয়েছে", 2)
+            kpi(k2[3], "এই গতিতে মাস শেষে", fmt_full(proj), f"Target-এর {proj / used_t * 100:.1f}%", 3)
+
+        if is_admin:
+            with st.expander("🎯 মাসিক Target সেট / পরিবর্তন"):
+                c1, c2 = st.columns(2)
+                m_in = c1.text_input("মাস (YYYY-MM)", value=tm, key=f"mt_month_{tm}")
+                v_in = c2.text_input("Target (কমা দিয়ে লিখলেও চলবে, যেমন 1,78,30,000)",
+                                     value=fmt_full(mt_val) if mt_val else "", key=f"mt_val_{tm}")
+                if st.button("💾 Target সেভ করুন"):
+                    if not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", m_in.strip()):
+                        st.error("মাস লিখুন এভাবে: 2026-11")
+                    else:
+                        digits = re.sub(r"\D", "", v_in)
+                        st.session_state.mt_raw[m_in.strip()] = int(digits) if digits else 0  # ফাঁকা = Target মুছে ফেলা
+                        save_mt()
+                        st.rerun()
+
+        # ---------- সব মাসের তুলনা ----------
+        mon = tgt.groupby("Month").agg(**{"Total Output": ("Daily Output", "sum")})
+        vm = valid.groupby("Month").agg(**{"Daily Target Sum": ("Daily Target", "sum"),
+                                           "Output on Target Days": ("Daily Output", "sum")})
         mon = mon.join(vm, how="left").reset_index()
-        mon["Achievement %"] = (mon["Output"] / mon["Target"] * 100).round(1)
+        mon["Monthly Target"] = mon["Month"].map(MT)
+        has_mt = mon["Monthly Target"].notna()
+        mon["Target"] = mon["Monthly Target"].where(has_mt, mon["Daily Target Sum"])
+        mon["Output"] = mon["Total Output"].where(has_mt, mon["Output on Target Days"])
+        mon["Achievement %"] = (mon["Output"] / mon["Target"] * 100).where(mon["Target"] > 0).round(1)
+        mon["Basis"] = has_mt.map({True: "মাসিক Target", False: "দৈনিক Target-এর যোগফল"})
 
-        sec_title("মাসিক Target বনাম Output")
+        sec_title("মাসিক Target বনাম Output (সব মাস)")
         c1, c2 = st.columns(2)
         with c1:
             f1 = go.Figure()
@@ -736,15 +994,15 @@ with t2:
                         range_color=[0, 100])
             f2.update_coloraxes(showscale=False)
             show(f2)
-        st.dataframe(mon, column_config=ACH_CFG, hide_index=True)
-        st.caption("Achievement শুধু Target দেওয়া দিনগুলোর হিসাবে (শুক্রবার ইত্যাদি বাদ)।")
+        mshow = mon[["Month", "Total Output", "Monthly Target", "Daily Target Sum", "Achievement %", "Basis"]].copy()
+        for c_ in ("Total Output", "Monthly Target", "Daily Target Sum"):
+            mshow[c_] = mshow[c_].map(fmt_full)
+        st.dataframe(mshow, column_config=ACH_CFG, hide_index=True)
+        st.caption("মাসিক Target সেট থাকলে Achievement = মাসের মোট Output ÷ মাসিক Target (শুক্রবারের Output-সহ)। "
+                   "সেট না থাকলে শুধু Target দেওয়া দিনগুলোর Output ÷ দৈনিক Target-এর যোগফল।")
 
+        # ---------- দৈনিক বিশ্লেষণ ----------
         sec_title("দৈনিক বিশ্লেষণ")
-        all_m = sorted(tgt["Month"].unique())
-        tm = st.selectbox("মাস", all_m, index=len(all_m) - 1, key="tm")
-        dd = tgt[tgt["Month"] == tm]
-        mv = valid[valid["Month"] == tm]
-        a_m = mv["Daily Output"].sum() / mv["Daily Target"].sum() * 100 if mv["Daily Target"].sum() > 0 else 0
         c1, c2 = st.columns([3, 2])
         with c1:
             f3 = go.Figure()
@@ -754,10 +1012,11 @@ with t2:
             f3.update_layout(title=f"{tm} · দৈনিক Output বনাম Target")
             show(f3, 400)
         with c2:
+            a_g = ach_m or 0
             f4 = go.Figure(go.Indicator(
-                mode="gauge+number", value=a_m, number={"suffix": "%", "valueformat": ".1f"},
+                mode="gauge+number", value=a_g, number={"suffix": "%", "valueformat": ".1f"},
                 title={"text": f"{tm} Achievement"},
-                gauge={"axis": {"range": [0, 100]}, "bar": {"color": "#3B82F6"},
+                gauge={"axis": {"range": [0, max(100, a_g)]}, "bar": {"color": "#3B82F6"},
                        "steps": [{"range": [0, 50], "color": "rgba(251,113,133,.28)"},
                                  {"range": [50, 80], "color": "rgba(255,176,32,.28)"},
                                  {"range": [80, 100], "color": "rgba(52,211,153,.28)"}]}))
@@ -766,15 +1025,17 @@ with t2:
         d2["Achievement %"] = (d2["Daily Output"] / d2["Daily Target"] * 100).round(1)
         st.dataframe(d2, column_config=ACH_CFG, hide_index=True)
 
-
         sec_title("দিনের Batch ও সময় (Start / End)")
         tdays = sorted(dd["Date"].dt.date.unique())
-        tsel = st.selectbox("দিন বেছে নিন", tdays, index=len(tdays) - 1, key="tday", format_func=fmt_day)
-        rd = prod[prod["Date"].dt.date == tsel]
-        if rd.empty:
-            st.info("এই দিনের Production লগ পাওয়া যায়নি।")
+        if tdays:
+            tsel = st.selectbox("দিন বেছে নিন", tdays, index=len(tdays) - 1, key="tday", format_func=fmt_day)
+            rd = prod[prod["Date"].dt.date == tsel]
+            if rd.empty:
+                st.info("এই দিনের Production লগ পাওয়া যায়নি।")
+            else:
+                st.dataframe(run_table(rd), hide_index=True)
         else:
-            st.dataframe(run_table(rd), hide_index=True)
+            st.info("এই মাসে এখনো কোনো Output ডেটা নেই।")
 
 # =====================================================================
 # Batch Release
@@ -845,10 +1106,123 @@ with t3:
                                 color_discrete_sequence=PALETTE))
 
 # =====================================================================
+# Export Order
+# =====================================================================
+with t_ex:
+    E = D.get("exp")
+    if E is None or E.empty:
+        st.info("Export Order Status ফাইলটা (Current Export Order Status শিটসহ) আপলোড করুন।")
+    else:
+        E = E.copy()
+        for c_ in ("Order Date", "Completed Date", "Delivery Date"):
+            E[c_] = pd.to_datetime(E[c_], errors="coerce")
+        for c_ in ("Required Box", "Required Pcs", "Batch Size", "Batches Req"):
+            E[c_] = pd.to_numeric(E[c_], errors="coerce")
+        E["Country"] = E["Country"].fillna("-").astype(str)
+        E["Group"] = E["Status"].map(status_group)
+        today = pd.Timestamp(date.today())
+
+        def dfmt(s):
+            return s.dt.strftime("%d %b %Y").fillna("-")
+
+        view_ex = st.radio("দেখুন", ["Open Orders", "Completed", "Demand (আসছে অর্ডার)"], horizontal=True, key="ex_view")
+
+        if view_ex == "Open Orders":
+            o = E[(E["Source"] == "Open") & (E["Group"] != "Completed")].copy()
+            o["Days to Delivery"] = (o["Delivery Date"] - today).dt.days
+            late = o[o["Days to Delivery"] < 0]
+            k = st.columns(4)
+            kpi(k[0], "Open Order লাইন", f"{len(o)}", f"{o['Country'].nunique()}টা দেশ", 0)
+            kpi(k[1], "মোট Required (Pcs)", fmt_full(o["Required Pcs"].sum()), "Open অর্ডারের", 1)
+            kpi(k[2], "Batch নিতে বাকি", f"{(o['Group'] == 'Batch need to take').sum()}", "Batch need to take", 2)
+            kpi(k[3], "Delivery Date পার", f"{len(late)}", f"{fmt_full(late['Required Pcs'].sum())} Pcs", 3)
+
+            sec_title("দেশ ও Status অনুযায়ী")
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                cy = o.groupby("Country", as_index=False)["Required Pcs"].sum().sort_values("Required Pcs")
+                show(px.bar(cy, x="Required Pcs", y="Country", orientation="h", title="দেশ অনুযায়ী Required (Pcs)",
+                            color_discrete_sequence=["#3B82F6"]), 420)
+            with c2:
+                sg = o.groupby("Group", as_index=False).size().rename(columns={"size": "Lines"})
+                show(px.pie(sg, names="Group", values="Lines", hole=0.55, title="Status অনুযায়ী লাইন",
+                            color_discrete_sequence=PALETTE), 420)
+
+            sec_title("Open Order তালিকা")
+            c1, c2 = st.columns(2)
+            fc = c1.multiselect("দেশ (ফাঁকা = সব)", sorted(o["Country"].unique()), key="ex_c")
+            fs = c2.multiselect("Status (ফাঁকা = সব)", sorted(o["Group"].unique()), key="ex_s")
+            fq = st.text_input("🔍 Product / Order No / Batch No খুঁজুন", key="ex_q")
+            r = o
+            if fc:
+                r = r[r["Country"].isin(fc)]
+            if fs:
+                r = r[r["Group"].isin(fs)]
+            if fq.strip():
+                ql = fq.strip().lower()
+                r = r[r["Product Name"].str.lower().str.contains(ql, regex=False)
+                      | r["Order No"].fillna("").str.lower().str.contains(ql, regex=False)
+                      | r["Batch Number"].fillna("").str.lower().str.contains(ql, regex=False)]
+            t = r.sort_values("Delivery Date")[["Country", "Product Name", "Order No", "Required Pcs", "Batches Req",
+                                                "Batch Number", "Status", "Delivery Date", "Days to Delivery"]].copy()
+            t["Delivery Date"] = dfmt(t["Delivery Date"])
+            t["Required Pcs"] = t["Required Pcs"].map(fmt_full)
+            t["Batches Req"] = t["Batches Req"].round(2)
+            st.dataframe(t, hide_index=True)
+            st.caption("Days to Delivery: আজ থেকে Delivery Date পর্যন্ত; মাইনাস মানে Delivery Date পার হয়ে গেছে।")
+            st.download_button("⬇️ এই তালিকা CSV", csv_bytes(t), "open_export_orders.csv", mime="text/csv")
+
+        elif view_ex == "Completed":
+            c = E[E["Source"] == "Completed"].copy()
+            ok = c[c["Group"] == "Completed"].copy()
+            both = ok[ok["Completed Date"].notna() & ok["Delivery Date"].notna()]
+            on_time = int((both["Completed Date"] <= both["Delivery Date"]).sum())
+            k = st.columns(4)
+            kpi(k[0], "Completed লাইন", f"{len(ok)}", c["Sheet"].iloc[0] if len(c) else "", 0)
+            kpi(k[1], "মোট Completed (Pcs)", fmt_full(ok["Required Pcs"].sum()), "অর্ডার করা পরিমাণ", 1)
+            kpi(k[2], "সময়মতো", f"{on_time}/{len(both)}", "Completed Date ≤ Delivery Date", 2)
+            kpi(k[3], "দেশ", f"{ok['Country'].nunique()}", "", 3)
+            if len(ok):
+                cy = ok.groupby("Country", as_index=False)["Required Pcs"].sum().sort_values("Required Pcs")
+                show(px.bar(cy, x="Required Pcs", y="Country", orientation="h",
+                            title="দেশ অনুযায়ী Completed (Pcs)", color_discrete_sequence=["#34D399"]), 420)
+                sec_title("Completed তালিকা")
+                t = ok.sort_values("Completed Date")[["Country", "Product Name", "Order No", "Required Pcs",
+                                                      "Batch Number", "Completed Date", "Delivery Date"]].copy()
+                t["Late (দিন)"] = (ok.loc[t.index, "Completed Date"] - ok.loc[t.index, "Delivery Date"]).dt.days
+                t["Completed Date"], t["Delivery Date"] = dfmt(t["Completed Date"]), dfmt(t["Delivery Date"])
+                t["Required Pcs"] = t["Required Pcs"].map(fmt_full)
+                st.dataframe(t, hide_index=True)
+                st.caption("Late (দিন): মাইনাস বা ০ = সময়মতো/আগে, প্লাস = Delivery Date-এর পরে হয়েছে।")
+
+        else:
+            dm = E[E["Source"] == "Demand"].copy()
+            sheets = list(dict.fromkeys(dm["Sheet"]))
+            if not sheets:
+                st.info("Demand শিট পাওয়া যায়নি।")
+            else:
+                sh_pick = st.selectbox("মাস", sheets, key="ex_dm")
+                m_ = dm[dm["Sheet"] == sh_pick].copy()
+                unit = m_["Pack Size"].iloc[0]
+                col = "Required Pcs" if unit == "Pcs" else "Required Box"
+                k = st.columns(3)
+                kpi(k[0], "অর্ডার লাইন", f"{len(m_)}", f"{m_['Country'].nunique()}টা দেশ", 0)
+                kpi(k[1], f"মোট ({unit})", fmt_full(m_[col].sum()), "এই মাসের Demand", 1)
+                kpi(k[2], "Batch নিতে বাকি", f"{(m_['Status'].fillna('').str.lower().str.contains('need to take')).sum()}", "", 2)
+                cy = m_.groupby("Country", as_index=False)[col].sum().sort_values(col)
+                show(px.bar(cy, x=col, y="Country", orientation="h", title=f"দেশ অনুযায়ী Demand ({unit})",
+                            color_discrete_sequence=["#FFB020"]), 400)
+                t = m_.sort_values("Delivery Date")[["Country", "Product Name", "Order No", col, "Status",
+                                                     "Order Date", "Delivery Date"]].copy()
+                t[col] = t[col].map(fmt_full)
+                t["Order Date"], t["Delivery Date"] = dfmt(t["Order Date"]), dfmt(t["Delivery Date"])
+                st.dataframe(t, hide_index=True)
+
+# =====================================================================
 # শুধু Admin: নতুন এন্ট্রি ও ডেটা
 # =====================================================================
 if is_admin:
-    with tabs[4]:
+    with tabs[5]:
         with st.form("entry", clear_on_submit=True):
             a, b, c = st.columns(3)
             stage = a.selectbox("Stage", ["Secondary", "Primary"])
@@ -884,6 +1258,7 @@ if is_admin:
                 st.session_state.manual = pd.concat(
                     [st.session_state.manual, pd.DataFrame([row])], ignore_index=True) \
                     if len(st.session_state.manual) else pd.DataFrame([row]).reindex(columns=PROD_COLS)
+                save_manual_now()
                 st.rerun()
 
         sec_title("হাতে দেওয়া এন্ট্রি")
@@ -896,6 +1271,7 @@ if is_admin:
         c1, c2, c3 = st.columns(3)
         if c1.button("↩️ শেষ এন্ট্রি মুছুন") and len(man):
             st.session_state.manual = man.iloc[:-1].reset_index(drop=True)
+            save_manual_now()
             st.rerun()
         if gh_ready():
             if c2.button("💾 এন্ট্রিগুলো স্থায়ীভাবে সেভ"):
@@ -909,19 +1285,25 @@ if is_admin:
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             st.caption("স্থায়ী করতে এই ফাইলটা GitHub-এর data ফোল্ডারে আপলোড করুন।")
 
-    with tabs[5]:
+    with tabs[6]:
         sec_title("লোড হওয়া ফাইল")
         st.write(", ".join(n for n, _ in files) or "কোনো ফাইল নেই")
-        k = st.columns(3)
+        k = st.columns(4)
         kpi(k[0], "Production সারি", f"{len(prod):,}", "Primary + Secondary", 0)
         kpi(k[1], "Target দিন", f"{len(tgt):,}", "", 1)
         kpi(k[2], "Batch সারি", f"{len(bat):,}", "", 2)
+        kpi(k[3], "Export Order সারি", f"{len(D.get('exp', [])):,}", "", 3)
+        st.caption("মাসিক Target: " + (", ".join(f"{m} = {fmt_full(v)}" for m, v in sorted(MT.items())) or "কিছু সেট করা নেই"))
+        st.download_button("⬇️ monthly_targets.json", json.dumps(st.session_state.mt_raw, ensure_ascii=False, indent=1).encode("utf-8"),
+                           MT_FILE.name, mime="application/json")
         with st.expander("Production ডেটা"):
             st.dataframe(prod[PROD_COLS], hide_index=True)
         with st.expander("Daily Target ডেটা"):
             st.dataframe(tgt[TARGET_COLS], hide_index=True)
         with st.expander("Batch Release ডেটা"):
             st.dataframe(bat[BATCH_COLS], hide_index=True)
+        with st.expander("Export Order ডেটা"):
+            st.dataframe(D.get("exp", pd.DataFrame(columns=EXPORT_COLS)), hide_index=True)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as xw:
             for name, frame, cols in (("Production", prod, PROD_COLS), ("Daily Target", tgt, TARGET_COLS),
@@ -929,5 +1311,7 @@ if is_admin:
                 f = frame[cols].copy()
                 f["Date"] = pd.to_datetime(f["Date"], errors="coerce").dt.date
                 f.to_excel(xw, sheet_name=name, index=False)
+            ex_ = D.get("exp", pd.DataFrame(columns=EXPORT_COLS)).reindex(columns=EXPORT_COLS)
+            ex_.to_excel(xw, sheet_name="Export Orders", index=False)
         st.download_button("⬇️ সব ডেটা Excel (ব্যাকআপ)", buf.getvalue(), "all_data.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
