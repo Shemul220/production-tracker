@@ -509,11 +509,25 @@ ACCENTS = ["#3B82F6", "#FFB020", "#22D3EE", "#A78BFA"]
 ACH_CFG = {"Achievement %": st.column_config.ProgressColumn(
     "Achievement %", format="%.1f%%", min_value=0, max_value=100)}
 
-# ---------- সব টেবিলে রং (দেশ/Stage/Line/Shift/Product/Output ইত্যাদি) ----------
-GEN_COLORS = ["#1d4ed8", "#b45309", "#047857", "#be123c", "#6d28d9", "#0e7490", "#a16207", "#c2410c",
-              "#4d7c0f", "#9d174d", "#0f766e", "#7c3aed"]
-SOFT_BG = [("#dbeafe", "#1e3a8a"), ("#fef3c7", "#78350f"), ("#dcfce7", "#14532d"), ("#fce7f3", "#831843"),
-           ("#ede9fe", "#4c1d95"), ("#cffafe", "#155e75")]
+# ---------- সব টেবিল: কলাম অনুযায়ী রঙিন ব্যাকগ্রাউন্ড, গাঢ় পরিষ্কার লেখা, বোল্ড হেডার ----------
+BODY_BG = ["#e0f2fe", "#fef9c3", "#dcfce7", "#fce7f3", "#ede9fe", "#ffedd5", "#cffafe", "#f1f5f9"]
+HEAD_BG = ["#7dd3fc", "#fde047", "#86efac", "#f9a8d4", "#c4b5fd", "#fdba74", "#67e8f9", "#cbd5e1"]
+SOFT_BG = [("#bfdbfe", "#1e3a8a"), ("#fde68a", "#78350f"), ("#bbf7d0", "#14532d"), ("#fbcfe8", "#831843"),
+           ("#ddd6fe", "#4c1d95"), ("#a5f3fc", "#155e75")]
+LAKH_COLS = {"Output", "Daily Output", "Total Output", "Daily Target", "Target", "Monthly Target",
+             "Daily Target Sum", "Output/Hr", "Output / Hr"}
+HASH_COLS = ["Country", "Line", "Machine", "Shift", "Type", "Month", "Week", "Day"]
+TBL_CSS = (
+    "<style>"
+    ".tbl-wrap{overflow:auto;border:1px solid #94a3b8;border-radius:10px;background:#fff}"
+    ".tbl-wrap table{border-collapse:collapse;width:100%;font-size:.84rem;color:#0f172a}"
+    ".tbl-wrap thead th{position:sticky;top:0;z-index:2;text-align:left;padding:.5rem .7rem;font-weight:800;"
+    "font-size:.88rem;border-bottom:2px solid #475569;white-space:nowrap;color:#0f172a}"
+    ".tbl-wrap tbody th{padding:.4rem .7rem;font-weight:800;background:#e2e8f0;color:#0f172a;text-align:left}"
+    ".tbl-wrap td{padding:.38rem .7rem;border-bottom:1px solid rgba(15,23,42,.12);white-space:nowrap;"
+    "color:#0f172a;font-weight:500}"
+    ".tbl-wrap tbody tr:nth-child(even) td{filter:brightness(.96)}"
+    "</style>")
 
 
 def _smap(sty, fn, cols=None):
@@ -525,50 +539,88 @@ def _hash_i(v):
     return sum(ord(ch) for ch in str(v))
 
 
-def style_any(df):
-    """যেকোনো টেবিলে কলামের নাম দেখে রং দেয়। বড় টেবিলে (৬০ হাজার ঘরের বেশি) রং ছাড়াই দেখায়।"""
-    if df.size > 60000:
-        return df
+def _soft_css(v):
+    if str(v) in ("", "-", "nan", "None"):
+        return ""
+    bg, fg = SOFT_BG[_hash_i(v) % len(SOFT_BG)]
+    return f"background-color:{bg};color:{fg};font-weight:700"
+
+
+def _stage_css(v):
+    return ("background-color:#93c5fd;color:#1e3a8a;font-weight:800" if v == "Primary" else
+            "background-color:#fcd34d;color:#78350f;font-weight:800" if v == "Secondary" else "")
+
+
+def _ach_css(v):
+    if pd.isna(v):
+        return ""
+    p = min(max(float(v), 0), 100)
+    return f"background:linear-gradient(90deg,#4ade80 {p}%,#f1f5f9 {p}%);color:#0f172a;font-weight:800"
+
+
+def html_table(df, extra=None, hide_index=True, height=560):
+    """রঙিন HTML টেবিল: কলাম অনুযায়ী ব্যাকগ্রাউন্ড, বোল্ড হেডার, গাঢ় লেখা।"""
     sty = df.style
+    if hide_index:
+        try:
+            sty = sty.hide(axis="index")
+        except Exception:  # noqa: BLE001
+            sty = sty.hide_index()
+    from html import escape as _esc
 
-    def put(cols, fn):
-        nonlocal sty
-        cols = [c for c in cols if c in df.columns]
-        if cols:
-            sty = _smap(sty, fn, cols)
+    def f_txt(v):
+        return "-" if (v is None or pd.isna(v)) else _esc(str(v))
 
-    put(["Stage"], lambda v: ("background-color:#dbeafe;color:#1e3a8a;font-weight:700" if v == "Primary" else
-                              "background-color:#fef3c7;color:#78350f;font-weight:700" if v == "Secondary" else ""))
-    put(["Line", "Machine", "Country", "Month", "Week", "Type", "Day", "Shift Owner"],
-        lambda v: f"color:{GEN_COLORS[_hash_i(v) % len(GEN_COLORS)]};font-weight:700" if str(v) not in ("", "-") else "")
-    put(["Shift"], lambda v: "background-color:%s;color:%s;font-weight:700" % SOFT_BG[_hash_i(v) % len(SOFT_BG)]
-        if str(v) not in ("", "-", "nan") else "")
-    put(["Date"], lambda v: "color:#6d28d9;font-weight:600")
-    put(["Product Name", "Product"], lambda v: "color:#1e3a8a;font-weight:600")
-    put(["Batch No", "Code", "Batch"], lambda v: "color:#7c3aed;font-weight:600")
-    put(["Run Start", "Run End"], lambda v: "color:#0f766e;font-weight:600")
-    put(["Output", "Daily Output", "Total Output", "Output/Hr", "Output / Hr"],
-        lambda v: "color:#0369a1;font-weight:700")
-    put(["Hours"], lambda v: "color:#b45309;font-weight:600")
-    put(["Daily Target", "Target", "Monthly Target", "Daily Target Sum"], lambda v: "color:#4338ca;font-weight:600")
-    put(["Batches", "Runs", "Entries"], lambda v: "color:#be185d;font-weight:600")
+    def f_pct(v):
+        return "-" if pd.isna(v) else f"{v:.1f}%"
+
+    def f_hrs(v):
+        return "-" if pd.isna(v) else f"{v:.2f}"
+    fm = {}
+    for c in df.columns:
+        num_ = pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c])
+        fm[c] = (fmt_full if num_ and c in LAKH_COLS else f_pct if num_ and c == "Achievement %"
+                 else f_hrs if num_ and c == "Hours" else f_txt)
+    sty = sty.format(fm)
+    head = []
+    for i, c in enumerate(df.columns):
+        sty = sty.set_properties(subset=[c], **{"background-color": BODY_BG[i % 8], "color": "#0f172a"})
+        head.append({"selector": f"th.col_heading.col{i}",
+                     "props": [("background-color", HEAD_BG[i % 8]), ("font-weight", "800")]})
+    sty = sty.set_table_styles(head, overwrite=False)
+    hc = [c for c in HASH_COLS if c in df.columns]
+    if hc:
+        sty = _smap(sty, _soft_css, hc)
+    if "Stage" in df:
+        sty = _smap(sty, _stage_css, ["Stage"])
+    if "Achievement %" in df:
+        sty = _smap(sty, _ach_css, ["Achievement %"])
     if {"Daily Output", "Daily Target"} <= set(df.columns):
         def met(col):
-            return ["background-color:#bbf7d0;color:#14532d;font-weight:700" if pd.notna(t) and pd.notna(o) and o >= t
-                    else "background-color:#fde68a;color:#78350f;font-weight:700" if pd.notna(t) and pd.notna(o)
+            return ["background-color:#86efac;color:#14532d;font-weight:800" if pd.notna(t) and pd.notna(o) and o >= t
+                    else "background-color:#fcd34d;color:#78350f;font-weight:800" if pd.notna(t) and pd.notna(o)
                     else "" for o, t in zip(col, df["Daily Target"])]
         sty = sty.apply(met, subset=["Daily Output"])
-    return sty
+    for kind, fn, cols in (extra or []):
+        if kind == "map":
+            sty = _smap(sty, fn, [c for c in cols if c in df.columns]) if any(c in df.columns for c in cols) else sty
+        elif kind == "rows":
+            sty = sty.apply(fn, axis=1)
+    html = "".join(line.strip() for line in sty.to_html().splitlines())
+    return f'{TBL_CSS}<div class="tbl-wrap" style="max-height:{int(height)}px">{html}</div>'
 
 
-def cdf(data, **kw):
-    """st.dataframe-এর বদলে: টেবিলে নিজে থেকে রং বসায় (ব্যর্থ হলে সাধারণ টেবিল)।"""
-    if isinstance(data, pd.DataFrame) and not data.empty:
+def cdf(data, extra=None, **kw):
+    """st.dataframe-এর বদলে: রঙিন টেবিল (বন্ধ করলে বা বড় টেবিল হলে সাধারণ ইন্টারঅ্যাকটিভ টেবিল)।"""
+    if (isinstance(data, pd.DataFrame) and not data.empty and data.size <= 5000
+            and st.session_state.get("color_tbl", True)):
         try:
-            data = style_any(data)
+            st.markdown(html_table(data, extra=extra, hide_index=kw.get("hide_index", False),
+                                   height=kw.get("height") or 560), unsafe_allow_html=True)
+            return
         except Exception:  # noqa: BLE001
             pass
-    return st.dataframe(data, **kw)
+    st.dataframe(data, **kw)
 
 
 st.markdown("""
@@ -901,6 +953,7 @@ fl = st.session_state.pop("flash", None)
 if fl:
     (st.success if fl[0] == "ok" else st.error)(fl[1])
 st.toggle("🖱️ চার্ট জুম/মুভ চালু করুন (স্ক্রল করার সময় বন্ধ রাখুন)", key="chart_edit")
+st.toggle("🎨 রঙিন টেবিল (বোল্ড হেডার)", value=True, key="color_tbl")
 labels = ["📊 Production", "📋 Daily Report", "🎯 Target vs Output", "📦 Batch Release", "🚢 Export Order"]
 if is_admin:
     labels += ["➕ নতুন এন্ট্রি", "🗂️ ডেটা"]
@@ -1269,11 +1322,6 @@ COUNTRY_COLORS = ["#1d4ed8", "#b45309", "#047857", "#be123c", "#6d28d9", "#0e749
                   "#4d7c0f", "#9d174d", "#0f766e", "#7c3aed"]
 
 
-def _smap(sty, fn, cols=None):
-    f = getattr(sty, "map", None) or sty.applymap
-    return f(fn, subset=cols) if cols else f(fn)
-
-
 def _status_css(v):
     bg, fg = STATUS_CSS.get(status_group(v if isinstance(v, str) and v != "-" else None), STATUS_CSS["Other"])
     return f"background-color:{bg};color:{fg};font-weight:600"
@@ -1308,65 +1356,42 @@ def _late_css(v):
 
 
 def style_ex(df, cmap):
-    """Export টেবিলে রং: দেশ, Status, তারিখ, সংখ্যা, Delivery বাকি দিন ইত্যাদি।"""
-    try:
-        sty = df.style
-        plain = {"Product Name": "color:#1e3a8a;font-weight:600", "Order No": "color:#6b7280",
-                 "SAP Code": "color:#6b7280", "Required Pcs": "color:#0369a1;font-weight:700",
-                 "Required Box": "color:#0369a1;font-weight:700", "Batch Number": "color:#7c3aed;font-weight:600",
-                 "Order Date": "color:#475569", "Delivery Date": "color:#6d28d9;font-weight:600",
-                 "Completed Date": "color:#047857;font-weight:600", "Remarks": "color:#9a3412"}
-        for col, css in plain.items():
-            if col in df:
-                sty = _smap(sty, lambda v, c=css: c, [col])
-        if "Country" in df:
-            sty = _smap(sty, lambda v: f"color:{cmap.get(v, '#334155')};font-weight:700", ["Country"])
-        if "Status" in df:
-            sty = _smap(sty, _status_css, ["Status"])
-        for col in ("RM Available", "PM Available", "PLSD"):
-            if col in df:
-                sty = _smap(sty, _mat_css, [col])
-        if "Days to Delivery" in df:
-            sty = _smap(sty, _days_css, ["Days to Delivery"])
-        if "Late (দিন)" in df:
-            sty = _smap(sty, _late_css, ["Late (দিন)"])
-        return sty
-    except Exception:  # noqa: BLE001
-        return df
+    """Export টেবিলের বাড়তি রং (ওভারলে): দেশ, Status, Delivery বাকি দিন, RM/PM ইত্যাদি।"""
+    ov = [("map", lambda v: "font-weight:700", ["Product Name", "Required Pcs", "Required Box"]),
+          ("map", _status_css, ["Status"]),
+          ("map", _mat_css, ["RM Available", "PM Available", "PLSD"]),
+          ("map", _days_css, ["Days to Delivery"]),
+          ("map", _late_css, ["Late (দিন)"])]
+    return ov
 
 
 def raw_style(df):
-    """মূল শিট দেখানোর টেবিলে রং: দেশের সারি, Total সারি, Status-এর লেখা।"""
+    """মূল শিট দেখানোর রং: দেশের সারি, Total সারি, হেডার সারি, Status-এর শব্দ।"""
     def row_css(row):
         vals = [v for v in row if v != ""]
         low = " ".join(vals).lower()
         if len(vals) == 1 and not vals[0].replace(".", "").isdigit():
-            css = "background-color:#fde68a;color:#78350f;font-weight:700"
+            css = "background-color:#fcd34d;color:#78350f;font-weight:800"
         elif "total" in low:
-            css = "background-color:#bbf7d0;color:#14532d;font-weight:700"
+            css = "background-color:#86efac;color:#14532d;font-weight:800"
         elif ("product" in low or "country" in low) and ("qty" in low or "order" in low or "date" in low):
-            css = "background-color:#bfdbfe;color:#1e3a8a;font-weight:700"
+            css = "background-color:#93c5fd;color:#1e3a8a;font-weight:800"
         else:
             css = ""
         return [css] * len(row)
 
     def cell_css(v):
         s = str(v).lower()
-        if "need to take" in s:
-            return "color:#b91c1c;font-weight:600"
+        if "need to take" in s or "unavail" in s or "short" in s:
+            return "background-color:#fecaca;color:#7f1d1d;font-weight:700"
         if "complete" in s:
-            return "color:#15803d;font-weight:600"
+            return "background-color:#bbf7d0;color:#14532d;font-weight:700"
         if "running" in s:
-            return "color:#1d4ed8;font-weight:600"
+            return "background-color:#bfdbfe;color:#1e3a8a;font-weight:700"
         if "ready" in s:
-            return "color:#b45309;font-weight:600"
-        if "unavail" in s or "short" in s:
-            return "color:#b91c1c"
+            return "background-color:#fde68a;color:#78350f;font-weight:700"
         return ""
-    try:
-        return _smap(df.style.apply(row_css, axis=1), cell_css)
-    except Exception:  # noqa: BLE001
-        return df
+    return [("map", cell_css, list(df.columns)), ("rows", row_css, None)]
 
 
 with t_ex:
@@ -1449,7 +1474,7 @@ with t_ex:
                     "Order Date", "Delivery Date", "Days to Delivery", "PLSD", "RM Available", "PM Available",
                     "Completed Date", "Remarks"]
             t = prep_ex(r.sort_values("Delivery Date"), cols)
-            cdf(style_ex(t, cmap), hide_index=True)
+            cdf(t, extra=style_ex(t, cmap), hide_index=True)
             st.caption("Days to Delivery: আজ থেকে Delivery Date পর্যন্ত; মাইনাস/লাল মানে Delivery Date পার হয়ে গেছে। "
                        "Remarks = ফাইলের 'Status from Production', Completed Date = 'Packaging Completed Date'।")
             st.download_button("⬇️ এই তালিকা CSV", csv_bytes(t), "open_export_orders.csv", mime="text/csv")
@@ -1474,7 +1499,7 @@ with t_ex:
                     "Required Box", "Required Pcs", "Batch Size", "Batches Req", "Batch Number", "Status",
                     "Order Date", "Completed Date", "Delivery Date", "Late (দিন)", "Remarks"]
             t = prep_ex(c.sort_values("Completed Date"), cols)
-            cdf(style_ex(t, cmap), hide_index=True)
+            cdf(t, extra=style_ex(t, cmap), hide_index=True)
             st.caption("Late (দিন): মাইনাস বা ০ = সময়মতো/আগে, প্লাস/লাল = Delivery Date-এর পরে হয়েছে। "
                        "Remarks-এ ফাইলের শেষের নোট/Available কলামগুলো আছে।")
             st.download_button("⬇️ এই তালিকা CSV", csv_bytes(t), "completed_export_orders.csv", mime="text/csv")
@@ -1500,7 +1525,7 @@ with t_ex:
                 cols = ["Country", "Product Name", "SAP Code", "Order No", col, "Status", "Order Date",
                         "Delivery Date", "SO Aging", "Remarks"]
                 t = prep_ex(m_.sort_values("Delivery Date"), cols)
-                cdf(style_ex(t, cmap), hide_index=True)
+                cdf(t, extra=style_ex(t, cmap), hide_index=True)
 
         else:
             if not RAW:
@@ -1510,7 +1535,7 @@ with t_ex:
                 g = RAW[sh]
                 st.caption(f"{sh}: {len(g)} সারি · {len(g.columns)} কলাম — ফাইলে যেমন আছে তেমন (A, B, C… = Excel কলাম)। "
                            "হলুদ = দেশ, সবুজ = Total, নীল = হেডার।")
-                cdf(raw_style(g), hide_index=True, height=560)
+                cdf(g, extra=raw_style(g), hide_index=True, height=560)
                 st.download_button("⬇️ এই শিট CSV", csv_bytes(g), f"{sh}.csv", mime="text/csv")
 
 # =====================================================================
