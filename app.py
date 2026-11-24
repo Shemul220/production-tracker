@@ -29,6 +29,8 @@ BATCH_COLS = ["Date", "Product Name", "Batch No", "Type"]
 # মাসিক Target (মাস → সংখ্যা)। এখানে দেওয়া মান ডিফল্ট; সাইট থেকে বদলালে data/monthly_targets.json-এ সেভ হয়।
 DEFAULT_MONTHLY_TARGETS = {"2026-11": 17830000}  # নভেম্বর'26 = 1,78,30,000
 MT_FILE = DATA_DIR / "monthly_targets.json"
+# ভুল মান → সঠিক মান (মাস: (ভুল, ঠিক))। নভেম্বর'26: 17,83,00,000 নয়, হবে 1,78,30,000
+TARGET_FIXES = {"2026-11": (178300000, 17830000)}
 
 # লগবুক ফাইলের কলামের অবস্থান (০ থেকে গোনা)। নতুন কলাম লাগলে এখানে যোগ করুন।
 SECONDARY_MAP = {0: "Date", 1: "Day", 2: "Shift", 3: "Shift Owner", 4: "Line", 5: "Code",
@@ -938,6 +940,10 @@ if "mt_raw" not in st.session_state:
             raw.update({str(k): int(v) for k, v in json.loads(MT_FILE.read_text("utf-8")).items()})
     except Exception:  # noqa: BLE001
         pass
+    # ভুল করে বসানো পুরনো মান (যেমন নভেম্বর'26-এ 17,83,00,000) নিজে থেকে ঠিক মানে বদলে যাবে
+    for _m, (_bad, _good) in TARGET_FIXES.items():
+        if raw.get(_m) == _bad:
+            raw[_m] = _good
     st.session_state.mt_raw = raw
 MT = {k: v for k, v in st.session_state.mt_raw.items() if v and v > 0}  # মাস → মাসিক Target
 
