@@ -27,7 +27,7 @@ TARGET_COLS = ["Date", "Daily Target", "Daily Output"]
 BATCH_COLS = ["Date", "Product Name", "Batch No", "Type"]
 
 # মাসিক Target (মাস → সংখ্যা)। এখানে দেওয়া মান ডিফল্ট; সাইট থেকে বদলালে data/monthly_targets.json-এ সেভ হয়।
-DEFAULT_MONTHLY_TARGETS = {"2026-11": 178300000}  # নভেম্বর'26 = 1,78,30,000
+DEFAULT_MONTHLY_TARGETS = {"2026-11": 17830000}  # নভেম্বর'26 = 1,78,30,000
 MT_FILE = DATA_DIR / "monthly_targets.json"
 
 # লগবুক ফাইলের কলামের অবস্থান (০ থেকে গোনা)। নতুন কলাম লাগলে এখানে যোগ করুন।
@@ -178,8 +178,16 @@ def parse_batches(wb, hdr, names):
 
 
 EXPORT_COLS = ["Source", "Sheet", "Country", "SAP Code", "Order No", "Machine", "Product Name", "Pack Size",
-               "Required Box", "Required Pcs", "Batch Size", "Batches Req", "Batch Number", "Status",
-               "Order Date", "Completed Date", "Delivery Date", "Remarks"]
+               "Pcs per Box", "Required Box", "Required Pcs", "Batch Size", "Batches Req", "Batch Number",
+               "Status", "Order Date", "Completed Date", "Delivery Date", "PLSD", "RM Available",
+               "PM Available", "Remarks", "SO Aging"]
+
+COUNTRY_FIX = {"keneya": "Kenya", "sri-lanka": "Sri Lanka", "sri lanka": "Sri Lanka", "srilanka": "Sri Lanka"}
+
+
+def clean_country(v):
+    s = txt(v)
+    return COUNTRY_FIX.get(s.lower(), s) if s else s
 
 
 def to_ddmmyy(v):
@@ -200,12 +208,22 @@ def to_ddmmyy(v):
     return None
 
 
-COUNTRY_FIX = {"keneya": "Kenya", "sri-lanka": "Sri Lanka", "sri lanka": "Sri Lanka", "srilanka": "Sri Lanka"}
+def _dt(v):
+    d = to_ddmmyy(v)
+    return d if d and d.year >= 2000 else None
 
 
-def clean_country(v):
-    s = txt(v)
-    return COUNTRY_FIX.get(s.lower(), s) if s else s
+def _note(v):
+    if isinstance(v, (datetime, date)):
+        return v.strftime("%d.%m.%y")
+    return txt(v)
+
+
+def _rec(source, sheet, country, **kw):
+    r = dict.fromkeys(EXPORT_COLS)
+    r.update(Source=source, Sheet=sheet, Country=country)
+    r.update(kw)
+    return r
 
 
 def _country(r):
@@ -214,13 +232,44 @@ def _country(r):
             and r[2] is None and not r[1].strip().lower().startswith("total"))
 
 
+def _demand_cols(hdr):
+    m = {}
+    for i, h in enumerate(hdr):
+        if not h:
+            continue
+        if h.startswith("country"):
+            m.setdefault("country", i)
+        elif "sales document" in h or h.startswith("order no"):
+            m.setdefault("so", i)
+        elif "name of product" in h or "product name" in h:
+            m.setdefault("prod", i)
+        elif "product code" in h:
+            m.setdefault("code", i)
+        elif "qty" in h:
+            m.setdefault("qty", i)
+            m["unit"] = "Box" if "box" in h else "Pcs"
+        elif "document date" in h or "receiving date" in h:
+            m.setdefault("odate", i)
+        elif "delivery date" in h:
+            m.setdefault("ddate", i)
+        elif "aging" in h:
+            m.setdefault("aging", i)
+        elif "pkg status" in h:
+            m.setdefault("pkg", i)
+        elif "mfg status" in h or h == "status":
+            m.setdefault("status", i)
+        elif "remark" in h:
+            m.setdefault("rem", i)
+    return m
+
+
 def parse_export(wb):
-    """Export Order Status ফাইল: Open order, চলতি মাসের Completed, আর Demand শিট।"""
+    """Export Order Status ফাইল: Open order, চলতি মাসের Completed, আর সব মাসের Demand শিট।"""
     recs, done_sheet = [], False
     for ws in wb.worksheets:
         title = (ws.title or "").strip()
         low = title.lower()
-        rows = list(ws.iter_rows(min_row=1, max_row=120, max_col=21, values_only=True))
+        rows = list(ws.iter_rows(min_row=1, max_row=150, max_col=21, values_only=True))
         rows = [tuple(r) + (None,) * (21 - len(r)) for r in rows]
         if low.startswith("current export order"):          # চলমান অর্ডার
             ctry = None
@@ -228,15 +277,16 @@ def parse_export(wb):
                 if _country(r):
                     ctry = clean_country(r[1])
                     continue
-                if not isinstance(r[2], (int, float)) or isinstance(r[4], (int, float)) or txt(r[4]) is None:
+                if not isinstance(r[2], (int, float)) or txt(r[4]) is None or isinstance(r[4], (int, float)):
                     continue
-                recs.append(dict(Source="Open", Sheet=title, Country=ctry, **{
+                recs.append(_rec("Open", title, ctry, **{
                     "SAP Code": txt(r[1]), "Order No": txt(r[2]), "Machine": txt(r[3]),
-                    "Product Name": txt(r[4]), "Pack Size": txt(r[5]), "Required Box": num(r[7]),
-                    "Required Pcs": num(r[8]), "Batch Size": num(r[9]), "Batches Req": num(r[10]),
-                    "Batch Number": txt(r[11]), "Status": txt(r[12]), "Order Date": to_ddmmyy(r[13]),
-                    "Completed Date": to_ddmmyy(r[18]), "Delivery Date": to_ddmmyy(r[14]),
-                    "Remarks": txt(r[19])}))
+                    "Product Name": txt(r[4]), "Pack Size": txt(r[5]), "Pcs per Box": num(r[6]),
+                    "Required Box": num(r[7]), "Required Pcs": num(r[8]), "Batch Size": num(r[9]),
+                    "Batches Req": num(r[10]), "Batch Number": txt(r[11]), "Status": txt(r[12]),
+                    "Order Date": _dt(r[13]), "Delivery Date": _dt(r[14]), "PLSD": _note(r[15]),
+                    "RM Available": _note(r[16]), "PM Available": _note(r[17]),
+                    "Completed Date": _dt(r[18]), "Remarks": _note(r[19])}))
         elif low.startswith("completed (") and not done_sheet:   # শুধু সবচেয়ে নতুন Completed শিট
             done_sheet, ctry = True, None
             for r in rows:
@@ -246,42 +296,79 @@ def parse_export(wb):
                 if not isinstance(r[2], (int, float)) or not isinstance(r[3], str):
                     continue
                 o = 0 if any(ch.isdigit() for ch in r[3]) else 1   # মেশিনের নাম থাকলে এক কলাম সরে যায়
-                recs.append(dict(Source="Completed", Sheet=title, Country=ctry, **{
+                notes = " | ".join(n for n in (_note(x) for x in r[15 + o:21]) if n) or None
+                recs.append(_rec("Completed", title, ctry, **{
                     "SAP Code": txt(r[1]), "Order No": txt(r[2]), "Machine": txt(r[3]) if o else None,
-                    "Product Name": txt(r[3 + o]), "Pack Size": txt(r[4 + o]), "Required Box": num(r[6 + o]),
-                    "Required Pcs": num(r[7 + o]), "Batch Size": num(r[8 + o]), "Batches Req": num(r[9 + o]),
-                    "Batch Number": txt(r[10 + o]), "Status": txt(r[11 + o]),
-                    "Order Date": to_ddmmyy(r[12 + o]), "Completed Date": to_ddmmyy(r[13 + o]),
-                    "Delivery Date": to_ddmmyy(r[14 + o]), "Remarks": None}))
-        elif rows and isinstance(rows[0][0], str) and rows[0][0].strip().lower().startswith("export order"):
-            hdr = [str(c).strip().lower() if c is not None else "" for c in rows[1]]
-            if len(hdr) < 9 or "sales document" not in hdr[1] or "qty" not in hdr[4]:
+                    "Product Name": txt(r[3 + o]), "Pack Size": txt(r[4 + o]), "Pcs per Box": num(r[5 + o]),
+                    "Required Box": num(r[6 + o]), "Required Pcs": num(r[7 + o]), "Batch Size": num(r[8 + o]),
+                    "Batches Req": num(r[9 + o]), "Batch Number": txt(r[10 + o]), "Status": txt(r[11 + o]),
+                    "Order Date": _dt(r[12 + o]), "Completed Date": _dt(r[13 + o]),
+                    "Delivery Date": _dt(r[14 + o]), "Remarks": notes}))
+        elif low.startswith("demand") or low.startswith("export order"):   # Demand শিট (সব মাস)
+            hdr_i = next((j for j, r in enumerate(rows[:5])
+                          if any(str(c or "").strip().lower().startswith("country") for c in r)), None)
+            if hdr_i is None:
                 continue
-            unit = "Box" if "box" in hdr[4] else "Pcs"
-            label = rows[0][0].strip()[len("export order"):].strip()
-            ctry = None
-            for r in rows[2:]:
-                if txt(r[0]):
-                    ctry = clean_country(r[0])
-                if not isinstance(r[1], (int, float)) or txt(r[2]) is None:
+            m = _demand_cols([str(c).strip().lower() if c is not None else "" for c in rows[hdr_i]])
+            if not all(k in m for k in ("country", "prod", "qty")):
+                continue
+            unit, ctry = m.get("unit", "Pcs"), None
+
+            def cell(r, key):
+                return r[m[key]] if key in m else None
+            for r in rows[hdr_i + 1:]:
+                if txt(r[m["country"]]):
+                    ctry = clean_country(r[m["country"]])
+                q = num(r[m["qty"]])
+                if q is None or txt(r[m["prod"]]) is None:
                     continue
-                recs.append(dict(Source="Demand", Sheet=label, Country=ctry, **{
-                    "SAP Code": txt(r[3]), "Order No": txt(r[1]), "Machine": None,
-                    "Product Name": txt(r[2]), "Pack Size": unit,
-                    "Required Box": num(r[4]) if unit == "Box" else None,
-                    "Required Pcs": num(r[4]) if unit == "Pcs" else None,
-                    "Batch Size": None, "Batches Req": None, "Batch Number": None, "Status": txt(r[8]),
-                    "Order Date": to_ddmmyy(r[5]), "Completed Date": None,
-                    "Delivery Date": to_ddmmyy(r[6]), "Remarks": None}))
+                rem = " | ".join(n for n in (("PKG: " + txt(cell(r, "pkg"))) if txt(cell(r, "pkg")) else None,
+                                             _note(cell(r, "rem"))) if n) or None
+                recs.append(_rec("Demand", title, ctry, **{
+                    "SAP Code": _note(cell(r, "code")), "Order No": _note(cell(r, "so")), "Pack Size": unit,
+                    "Product Name": txt(r[m["prod"]]),
+                    "Required Box": q if unit == "Box" else None, "Required Pcs": q if unit == "Pcs" else None,
+                    "Status": _note(cell(r, "status")), "Order Date": _dt(cell(r, "odate")),
+                    "Delivery Date": _dt(cell(r, "ddate")), "SO Aging": _note(cell(r, "aging")),
+                    "Remarks": rem}))
     return recs
 
 
+def _cell_txt(v):
+    if v is None:
+        return ""
+    if isinstance(v, (datetime, date)):
+        return v.strftime("%d.%m.%Y")
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() else f"{v:.4g}"
+    return re.sub(r"\s+", " ", str(v)).strip()
+
+
+def parse_export_raw(wb):
+    """ফাইলের প্রতিটা শিট যেমন আছে তেমন (সব কলাম, সব সারি) — শুধু দেখার জন্য।"""
+    from openpyxl.utils import get_column_letter
+    out = {}
+    for ws in wb.worksheets:
+        rows = list(ws.iter_rows(min_row=1, max_row=250, max_col=26, values_only=True))
+        grid = [[_cell_txt(v) for v in r] for r in rows]
+        grid = [r for r in grid if any(r)]
+        if not grid:
+            continue
+        width = max(len(r) for r in grid)
+        grid = [r + [""] * (width - len(r)) for r in grid]
+        keep = [i for i in range(width) if any(r[i] for r in grid)]
+        out[(ws.title or "").strip()] = pd.DataFrame([[r[i] for i in keep] for r in grid],
+                                                     columns=[get_column_letter(i + 1) for i in keep])
+    return out
+
+
 def status_group(s):
-    t = (s or "").lower()
+    t = s.lower().strip() if isinstance(s, str) else ""
     for key, name in (("complete", "Completed"), ("hold", "Hold"), ("need to take", "Batch need to take"),
                       ("running", "Packing running"), ("blister", "Ready for Blister"),
-                      ("compress", "Ready for Compression"), ("granul", "Ready for Granulation"),
-                      ("coating", "Ready for Coating"), ("packing", "Ready for Packing")):
+                      ("bilister", "Ready for Blister"), ("compress", "Ready for Compression"),
+                      ("granul", "Ready for Granulation"), ("coating", "Ready for Coating"),
+                      ("packing", "Ready for Packing")):
         if key in t:
             return name
     return "Other" if t else "Unknown"
@@ -289,7 +376,7 @@ def status_group(s):
 
 @st.cache_data(show_spinner="ফাইল পড়া হচ্ছে...")
 def load_files(files):
-    prod, tgt, bat, exp, errors = [], [], [], [], []
+    prod, tgt, bat, exp, expraw, errors = [], [], [], [], [], []
     for name, data in files:
         try:
             wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
@@ -305,6 +392,7 @@ def load_files(files):
                 continue
             if any(n.strip().lower().startswith("current export order") for n in wb.sheetnames):
                 exp.append(pd.DataFrame(parse_export(wb), columns=EXPORT_COLS))  # Export Order Status ফাইল
+                expraw.append(parse_export_raw(wb))
                 continue
             t = parse_targets(wb)
             if t:
@@ -327,7 +415,7 @@ def load_files(files):
     B = B.drop_duplicates(["Date", "Batch No", "Product Name"]) if len(B) else B
     # একাধিক Export ফাইল থাকলে সবচেয়ে শেষেরটা (নতুন আপলোড) নেওয়া হয়, যাতে পুরনো/নতুন ভার্সন দ্বিগুণ না হয়
     X = exp[-1] if exp else pd.DataFrame(columns=EXPORT_COLS)
-    return {"prod": P, "tgt": T, "bat": B, "exp": X}, errors
+    return {"prod": P, "tgt": T, "bat": B, "exp": X, "expraw": (expraw[-1] if expraw else {})}, errors
 
 
 # ---------- হিসাব ----------
@@ -420,6 +508,68 @@ STAGE_COL = {"Primary": "#3B82F6", "Secondary": "#FFB020"}
 ACCENTS = ["#3B82F6", "#FFB020", "#22D3EE", "#A78BFA"]
 ACH_CFG = {"Achievement %": st.column_config.ProgressColumn(
     "Achievement %", format="%.1f%%", min_value=0, max_value=100)}
+
+# ---------- সব টেবিলে রং (দেশ/Stage/Line/Shift/Product/Output ইত্যাদি) ----------
+GEN_COLORS = ["#1d4ed8", "#b45309", "#047857", "#be123c", "#6d28d9", "#0e7490", "#a16207", "#c2410c",
+              "#4d7c0f", "#9d174d", "#0f766e", "#7c3aed"]
+SOFT_BG = [("#dbeafe", "#1e3a8a"), ("#fef3c7", "#78350f"), ("#dcfce7", "#14532d"), ("#fce7f3", "#831843"),
+           ("#ede9fe", "#4c1d95"), ("#cffafe", "#155e75")]
+
+
+def _smap(sty, fn, cols=None):
+    f = getattr(sty, "map", None) or sty.applymap
+    return f(fn, subset=cols) if cols else f(fn)
+
+
+def _hash_i(v):
+    return sum(ord(ch) for ch in str(v))
+
+
+def style_any(df):
+    """যেকোনো টেবিলে কলামের নাম দেখে রং দেয়। বড় টেবিলে (৬০ হাজার ঘরের বেশি) রং ছাড়াই দেখায়।"""
+    if df.size > 60000:
+        return df
+    sty = df.style
+
+    def put(cols, fn):
+        nonlocal sty
+        cols = [c for c in cols if c in df.columns]
+        if cols:
+            sty = _smap(sty, fn, cols)
+
+    put(["Stage"], lambda v: ("background-color:#dbeafe;color:#1e3a8a;font-weight:700" if v == "Primary" else
+                              "background-color:#fef3c7;color:#78350f;font-weight:700" if v == "Secondary" else ""))
+    put(["Line", "Machine", "Country", "Month", "Week", "Type", "Day", "Shift Owner"],
+        lambda v: f"color:{GEN_COLORS[_hash_i(v) % len(GEN_COLORS)]};font-weight:700" if str(v) not in ("", "-") else "")
+    put(["Shift"], lambda v: "background-color:%s;color:%s;font-weight:700" % SOFT_BG[_hash_i(v) % len(SOFT_BG)]
+        if str(v) not in ("", "-", "nan") else "")
+    put(["Date"], lambda v: "color:#6d28d9;font-weight:600")
+    put(["Product Name", "Product"], lambda v: "color:#1e3a8a;font-weight:600")
+    put(["Batch No", "Code", "Batch"], lambda v: "color:#7c3aed;font-weight:600")
+    put(["Run Start", "Run End"], lambda v: "color:#0f766e;font-weight:600")
+    put(["Output", "Daily Output", "Total Output", "Output/Hr", "Output / Hr"],
+        lambda v: "color:#0369a1;font-weight:700")
+    put(["Hours"], lambda v: "color:#b45309;font-weight:600")
+    put(["Daily Target", "Target", "Monthly Target", "Daily Target Sum"], lambda v: "color:#4338ca;font-weight:600")
+    put(["Batches", "Runs", "Entries"], lambda v: "color:#be185d;font-weight:600")
+    if {"Daily Output", "Daily Target"} <= set(df.columns):
+        def met(col):
+            return ["background-color:#bbf7d0;color:#14532d;font-weight:700" if pd.notna(t) and pd.notna(o) and o >= t
+                    else "background-color:#fde68a;color:#78350f;font-weight:700" if pd.notna(t) and pd.notna(o)
+                    else "" for o, t in zip(col, df["Daily Target"])]
+        sty = sty.apply(met, subset=["Daily Output"])
+    return sty
+
+
+def cdf(data, **kw):
+    """st.dataframe-এর বদলে: টেবিলে নিজে থেকে রং বসায় (ব্যর্থ হলে সাধারণ টেবিল)।"""
+    if isinstance(data, pd.DataFrame) and not data.empty:
+        try:
+            data = style_any(data)
+        except Exception:  # noqa: BLE001
+            pass
+    return st.dataframe(data, **kw)
+
 
 st.markdown("""
 <style>
@@ -805,7 +955,7 @@ with t1:
         with c2:
             show(px.line(wk, x="Week", y="Achievement %", color="Stage", markers=True,
                          color_discrete_map=STAGE_COL, title="সাপ্তাহিক Achievement %"))
-        st.dataframe(wk, column_config=ACH_CFG, hide_index=True)
+        cdf(wk, column_config=ACH_CFG, hide_index=True)
 
         sec_title("Line / Machine ও Shift")
         ln = summarize(view, ["Stage", "Line"]).reset_index().sort_values("Output")
@@ -817,7 +967,7 @@ with t1:
             sh = view.groupby("Shift", as_index=False)["Output"].sum()
             show(px.pie(sh, names="Shift", values="Output", hole=0.55,
                         color_discrete_sequence=PALETTE, title="Shift অনুযায়ী Output"), 420)
-        st.dataframe(ln.sort_values("Output", ascending=False), column_config=ACH_CFG, hide_index=True)
+        cdf(ln.sort_values("Output", ascending=False), column_config=ACH_CFG, hide_index=True)
 
         sec_title("Product অনুযায়ী")
         pr = summarize(view, "Product Name").sort_values("Output", ascending=False)
@@ -826,7 +976,7 @@ with t1:
                      color="Output", color_continuous_scale=["#9CCBF5", "#3B82F6", "#0B3C6F"])
         fig.update_coloraxes(showscale=False)
         show(fig, 420)
-        st.dataframe(pr, column_config=ACH_CFG)
+        cdf(pr, column_config=ACH_CFG)
 
 # =====================================================================
 # Daily Report: Batch, Start/End, Product-Batch, Line ফিল্টার
@@ -867,7 +1017,7 @@ with t_dr:
 
             sec_title("দৈনিক রিপোর্ট (Batch, Start ও End সময়সহ)")
             rt = run_table(v)
-            st.dataframe(rt, hide_index=True)
+            cdf(rt, hide_index=True)
             st.download_button("⬇️ এই রিপোর্ট CSV", csv_bytes(rt), "daily_report.csv", mime="text/csv")
 
             sec_title("Product অনুযায়ী: কয়টা Batch, কোন কোন Batch No")
@@ -877,7 +1027,7 @@ with t_dr:
             ).reset_index().rename(columns={"Batch_Numbers": "Batch Numbers"})
             ps["Output"] = ps["Output"].round(0).astype("int64")
             ps["Hours"] = ps["Hours"].round(1)
-            st.dataframe(ps.sort_values("Output", ascending=False), hide_index=True)
+            cdf(ps.sort_values("Output", ascending=False), hide_index=True)
 
             sec_title("একটা Product বেছে বিস্তারিত দেখুন")
             psel = st.selectbox("Product", ["—"] + sorted(v["Product Name"].unique()), key="dr_prod")
@@ -890,14 +1040,14 @@ with t_dr:
                 bt["Output"] = bt["Output"].round(0).astype("int64")
                 bt["Hours"] = bt["Hours"].round(1)
                 st.caption(f"{psel}: মোট {nb(pv['Batch No'])}টা Batch")
-                st.dataframe(bt, hide_index=True)
+                cdf(bt, hide_index=True)
 
             sec_title("Line অনুযায়ী কোন কোন Product হয়েছে")
             lp = v.groupby(["Stage", "Line", "Product Name"]).agg(
                 Batches=("Batch No", nb), Output=("Output", "sum"), Hours=("Hours", "sum")).reset_index()
             lp["Output"] = lp["Output"].round(0).astype("int64")
             lp["Hours"] = lp["Hours"].round(1)
-            st.dataframe(lp.sort_values(["Stage", "Line", "Output"], ascending=[True, True, False]), hide_index=True)
+            cdf(lp.sort_values(["Stage", "Line", "Output"], ascending=[True, True, False]), hide_index=True)
 
 # =====================================================================
 # Target vs Output
@@ -997,7 +1147,7 @@ with t2:
         mshow = mon[["Month", "Total Output", "Monthly Target", "Daily Target Sum", "Achievement %", "Basis"]].copy()
         for c_ in ("Total Output", "Monthly Target", "Daily Target Sum"):
             mshow[c_] = mshow[c_].map(fmt_full)
-        st.dataframe(mshow, column_config=ACH_CFG, hide_index=True)
+        cdf(mshow, column_config=ACH_CFG, hide_index=True)
         st.caption("মাসিক Target সেট থাকলে Achievement = মাসের মোট Output ÷ মাসিক Target (শুক্রবারের Output-সহ)। "
                    "সেট না থাকলে শুধু Target দেওয়া দিনগুলোর Output ÷ দৈনিক Target-এর যোগফল।")
 
@@ -1023,7 +1173,7 @@ with t2:
             show(f4, 400)
         d2 = dd[["Date", "Daily Target", "Daily Output"]].copy()
         d2["Achievement %"] = (d2["Daily Output"] / d2["Daily Target"] * 100).round(1)
-        st.dataframe(d2, column_config=ACH_CFG, hide_index=True)
+        cdf(d2, column_config=ACH_CFG, hide_index=True)
 
         sec_title("দিনের Batch ও সময় (Start / End)")
         tdays = sorted(dd["Date"].dt.date.unique())
@@ -1033,7 +1183,7 @@ with t2:
             if rd.empty:
                 st.info("এই দিনের Production লগ পাওয়া যায়নি।")
             else:
-                st.dataframe(run_table(rd), hide_index=True)
+                cdf(run_table(rd), hide_index=True)
         else:
             st.info("এই মাসে এখনো কোনো Output ডেটা নেই।")
 
@@ -1073,7 +1223,7 @@ with t3:
             sec_title("Batch Release তালিকা (কবে Release হয়েছে)")
             tb = r.sort_values(["Date", "Product Name"], ascending=[False, True])[["Date", "Product Name", "Batch No", "Type"]].copy()
             tb["Date"] = tb["Date"].dt.strftime("%d %b %Y")
-            st.dataframe(tb, hide_index=True)
+            cdf(tb, hide_index=True)
             st.download_button("⬇️ এই তালিকা CSV", csv_bytes(tb), "batch_release.csv", mime="text/csv")
 
             sec_title("Product অনুযায়ী: কয়টা Batch, কোন কোন Batch No")
@@ -1082,13 +1232,13 @@ with t3:
                 Batch_Numbers=("Batch No", join_set)).reset_index().rename(columns={"Batch_Numbers": "Batch Numbers"})
             pr["First"] = pr["First"].dt.strftime("%d %b %Y")
             pr["Last"] = pr["Last"].dt.strftime("%d %b %Y")
-            st.dataframe(pr.sort_values("Batches", ascending=False), hide_index=True)
+            cdf(pr.sort_values("Batches", ascending=False), hide_index=True)
 
             if bq.strip():
                 prodrun = prod[prod["Batch No"].isin(set(r["Batch No"]))]
                 if not prodrun.empty:
                     sec_title("এই Batch-এর Production (Start / End সময়সহ)")
-                    st.dataframe(run_table(prodrun), hide_index=True)
+                    cdf(run_table(prodrun), hide_index=True)
 
         with st.expander("📈 চার্ট দেখুন"):
             mt = bat.groupby(["Month", "Type"], as_index=False).size().rename(columns={"size": "Batches"})
@@ -1108,28 +1258,158 @@ with t3:
 # =====================================================================
 # Export Order
 # =====================================================================
+STATUS_CSS = {
+    "Completed": ("#bbf7d0", "#14532d"), "Packing running": ("#bfdbfe", "#1e3a8a"),
+    "Ready for Blister": ("#fde68a", "#78350f"), "Ready for Compression": ("#fed7aa", "#7c2d12"),
+    "Ready for Granulation": ("#ddd6fe", "#4c1d95"), "Ready for Coating": ("#fbcfe8", "#831843"),
+    "Ready for Packing": ("#a5f3fc", "#164e63"), "Batch need to take": ("#fecaca", "#7f1d1d"),
+    "Hold": ("#e5e7eb", "#374151"), "Other": ("#e0e7ff", "#3730a3"), "Unknown": ("#f3f4f6", "#6b7280"),
+}
+COUNTRY_COLORS = ["#1d4ed8", "#b45309", "#047857", "#be123c", "#6d28d9", "#0e7490", "#a16207", "#c2410c",
+                  "#4d7c0f", "#9d174d", "#0f766e", "#7c3aed"]
+
+
+def _smap(sty, fn, cols=None):
+    f = getattr(sty, "map", None) or sty.applymap
+    return f(fn, subset=cols) if cols else f(fn)
+
+
+def _status_css(v):
+    bg, fg = STATUS_CSS.get(status_group(v if isinstance(v, str) and v != "-" else None), STATUS_CSS["Other"])
+    return f"background-color:{bg};color:{fg};font-weight:600"
+
+
+def _mat_css(v):
+    s = str(v).lower()
+    if s in ("-", "", "nan", "none"):
+        return ""
+    if "unavail" in s or "short" in s or "not " in s:
+        return "background-color:#fecaca;color:#7f1d1d;font-weight:600"
+    if "avail" in s:
+        return "background-color:#bbf7d0;color:#14532d;font-weight:600"
+    return "background-color:#fef3c7;color:#92400e;font-weight:600"
+
+
+def _days_css(v):
+    if pd.isna(v):
+        return ""
+    if v < 0:
+        return "background-color:#fecaca;color:#b91c1c;font-weight:700"
+    if v <= 7:
+        return "background-color:#fde68a;color:#92400e;font-weight:700"
+    return "background-color:#bbf7d0;color:#166534;font-weight:700"
+
+
+def _late_css(v):
+    if pd.isna(v):
+        return ""
+    return ("background-color:#fecaca;color:#b91c1c;font-weight:700" if v > 0
+            else "background-color:#bbf7d0;color:#166534;font-weight:700")
+
+
+def style_ex(df, cmap):
+    """Export টেবিলে রং: দেশ, Status, তারিখ, সংখ্যা, Delivery বাকি দিন ইত্যাদি।"""
+    try:
+        sty = df.style
+        plain = {"Product Name": "color:#1e3a8a;font-weight:600", "Order No": "color:#6b7280",
+                 "SAP Code": "color:#6b7280", "Required Pcs": "color:#0369a1;font-weight:700",
+                 "Required Box": "color:#0369a1;font-weight:700", "Batch Number": "color:#7c3aed;font-weight:600",
+                 "Order Date": "color:#475569", "Delivery Date": "color:#6d28d9;font-weight:600",
+                 "Completed Date": "color:#047857;font-weight:600", "Remarks": "color:#9a3412"}
+        for col, css in plain.items():
+            if col in df:
+                sty = _smap(sty, lambda v, c=css: c, [col])
+        if "Country" in df:
+            sty = _smap(sty, lambda v: f"color:{cmap.get(v, '#334155')};font-weight:700", ["Country"])
+        if "Status" in df:
+            sty = _smap(sty, _status_css, ["Status"])
+        for col in ("RM Available", "PM Available", "PLSD"):
+            if col in df:
+                sty = _smap(sty, _mat_css, [col])
+        if "Days to Delivery" in df:
+            sty = _smap(sty, _days_css, ["Days to Delivery"])
+        if "Late (দিন)" in df:
+            sty = _smap(sty, _late_css, ["Late (দিন)"])
+        return sty
+    except Exception:  # noqa: BLE001
+        return df
+
+
+def raw_style(df):
+    """মূল শিট দেখানোর টেবিলে রং: দেশের সারি, Total সারি, Status-এর লেখা।"""
+    def row_css(row):
+        vals = [v for v in row if v != ""]
+        low = " ".join(vals).lower()
+        if len(vals) == 1 and not vals[0].replace(".", "").isdigit():
+            css = "background-color:#fde68a;color:#78350f;font-weight:700"
+        elif "total" in low:
+            css = "background-color:#bbf7d0;color:#14532d;font-weight:700"
+        elif ("product" in low or "country" in low) and ("qty" in low or "order" in low or "date" in low):
+            css = "background-color:#bfdbfe;color:#1e3a8a;font-weight:700"
+        else:
+            css = ""
+        return [css] * len(row)
+
+    def cell_css(v):
+        s = str(v).lower()
+        if "need to take" in s:
+            return "color:#b91c1c;font-weight:600"
+        if "complete" in s:
+            return "color:#15803d;font-weight:600"
+        if "running" in s:
+            return "color:#1d4ed8;font-weight:600"
+        if "ready" in s:
+            return "color:#b45309;font-weight:600"
+        if "unavail" in s or "short" in s:
+            return "color:#b91c1c"
+        return ""
+    try:
+        return _smap(df.style.apply(row_css, axis=1), cell_css)
+    except Exception:  # noqa: BLE001
+        return df
+
+
 with t_ex:
     E = D.get("exp")
+    RAW = D.get("expraw") or {}
     if E is None or E.empty:
         st.info("Export Order Status ফাইলটা (Current Export Order Status শিটসহ) আপলোড করুন।")
     else:
-        E = E.copy()
+        E = E.reindex(columns=EXPORT_COLS).copy()
         for c_ in ("Order Date", "Completed Date", "Delivery Date"):
             E[c_] = pd.to_datetime(E[c_], errors="coerce")
-        for c_ in ("Required Box", "Required Pcs", "Batch Size", "Batches Req"):
+        for c_ in ("Pcs per Box", "Required Box", "Required Pcs", "Batch Size", "Batches Req"):
             E[c_] = pd.to_numeric(E[c_], errors="coerce")
         E["Country"] = E["Country"].fillna("-").astype(str)
         E["Group"] = E["Status"].map(status_group)
         today = pd.Timestamp(date.today())
+        cmap = {c_: COUNTRY_COLORS[i % len(COUNTRY_COLORS)] for i, c_ in enumerate(sorted(E["Country"].unique()))}
 
         def dfmt(s):
             return s.dt.strftime("%d %b %Y").fillna("-")
 
-        view_ex = st.radio("দেখুন", ["Open Orders", "Completed", "Demand (আসছে অর্ডার)"], horizontal=True, key="ex_view")
+        def prep_ex(d, cols):
+            t = d[cols].copy()
+            for c in ("Order Date", "Completed Date", "Delivery Date"):
+                if c in t:
+                    t[c] = dfmt(t[c])
+            for c in ("Required Pcs", "Required Box", "Batch Size", "Pcs per Box"):
+                if c in t:
+                    t[c] = t[c].map(fmt_full)
+            if "Batches Req" in t:
+                t["Batches Req"] = t["Batches Req"].round(2)
+            for c in t.columns:
+                if not pd.api.types.is_numeric_dtype(t[c]):
+                    t[c] = t[c].fillna("-").astype(str)
+            return t
+
+        view_ex = st.radio("দেখুন", ["Open Orders", "Completed", "Demand (আসছে অর্ডার)", "সব শিট (মূল ফাইল)"],
+                           horizontal=True, key="ex_view")
 
         if view_ex == "Open Orders":
-            o = E[(E["Source"] == "Open") & (E["Group"] != "Completed")].copy()
-            o["Days to Delivery"] = (o["Delivery Date"] - today).dt.days
+            o_all = E[E["Source"] == "Open"].copy()
+            o_all["Days to Delivery"] = (o_all["Delivery Date"] - today).dt.days
+            o = o_all[o_all["Group"] != "Completed"]
             late = o[o["Days to Delivery"] < 0]
             k = st.columns(4)
             kpi(k[0], "Open Order লাইন", f"{len(o)}", f"{o['Country'].nunique()}টা দেশ", 0)
@@ -1142,39 +1422,42 @@ with t_ex:
             with c1:
                 cy = o.groupby("Country", as_index=False)["Required Pcs"].sum().sort_values("Required Pcs")
                 show(px.bar(cy, x="Required Pcs", y="Country", orientation="h", title="দেশ অনুযায়ী Required (Pcs)",
-                            color_discrete_sequence=["#3B82F6"]), 420)
+                            color="Country", color_discrete_map=cmap), 420)
             with c2:
                 sg = o.groupby("Group", as_index=False).size().rename(columns={"size": "Lines"})
                 show(px.pie(sg, names="Group", values="Lines", hole=0.55, title="Status অনুযায়ী লাইন",
-                            color_discrete_sequence=PALETTE), 420)
+                            color="Group", color_discrete_map={g: v[0] for g, v in STATUS_CSS.items()}), 420)
 
-            sec_title("Open Order তালিকা")
+            sec_title("Open Order তালিকা (ফাইলের সব কলাম)")
             c1, c2 = st.columns(2)
-            fc = c1.multiselect("দেশ (ফাঁকা = সব)", sorted(o["Country"].unique()), key="ex_c")
-            fs = c2.multiselect("Status (ফাঁকা = সব)", sorted(o["Group"].unique()), key="ex_s")
+            fc = c1.multiselect("দেশ (ফাঁকা = সব)", sorted(o_all["Country"].unique()), key="ex_c")
+            fs = c2.multiselect("Status (ফাঁকা = সব)", sorted(o_all["Group"].unique()), key="ex_s")
             fq = st.text_input("🔍 Product / Order No / Batch No খুঁজুন", key="ex_q")
-            r = o
+            show_done = st.checkbox("Completed স্ট্যাটাসের লাইনও দেখান", key="ex_done")
+            r = o_all if show_done else o
             if fc:
                 r = r[r["Country"].isin(fc)]
             if fs:
                 r = r[r["Group"].isin(fs)]
             if fq.strip():
                 ql = fq.strip().lower()
-                r = r[r["Product Name"].str.lower().str.contains(ql, regex=False)
+                r = r[r["Product Name"].fillna("").str.lower().str.contains(ql, regex=False)
                       | r["Order No"].fillna("").str.lower().str.contains(ql, regex=False)
                       | r["Batch Number"].fillna("").str.lower().str.contains(ql, regex=False)]
-            t = r.sort_values("Delivery Date")[["Country", "Product Name", "Order No", "Required Pcs", "Batches Req",
-                                                "Batch Number", "Status", "Delivery Date", "Days to Delivery"]].copy()
-            t["Delivery Date"] = dfmt(t["Delivery Date"])
-            t["Required Pcs"] = t["Required Pcs"].map(fmt_full)
-            t["Batches Req"] = t["Batches Req"].round(2)
-            st.dataframe(t, hide_index=True)
-            st.caption("Days to Delivery: আজ থেকে Delivery Date পর্যন্ত; মাইনাস মানে Delivery Date পার হয়ে গেছে।")
+            cols = ["Country", "Product Name", "SAP Code", "Order No", "Machine", "Pack Size", "Pcs per Box",
+                    "Required Box", "Required Pcs", "Batch Size", "Batches Req", "Batch Number", "Status",
+                    "Order Date", "Delivery Date", "Days to Delivery", "PLSD", "RM Available", "PM Available",
+                    "Completed Date", "Remarks"]
+            t = prep_ex(r.sort_values("Delivery Date"), cols)
+            cdf(style_ex(t, cmap), hide_index=True)
+            st.caption("Days to Delivery: আজ থেকে Delivery Date পর্যন্ত; মাইনাস/লাল মানে Delivery Date পার হয়ে গেছে। "
+                       "Remarks = ফাইলের 'Status from Production', Completed Date = 'Packaging Completed Date'।")
             st.download_button("⬇️ এই তালিকা CSV", csv_bytes(t), "open_export_orders.csv", mime="text/csv")
 
         elif view_ex == "Completed":
             c = E[E["Source"] == "Completed"].copy()
-            ok = c[c["Group"] == "Completed"].copy()
+            c["Late (দিন)"] = (c["Completed Date"] - c["Delivery Date"]).dt.days
+            ok = c[c["Group"] == "Completed"]
             both = ok[ok["Completed Date"].notna() & ok["Delivery Date"].notna()]
             on_time = int((both["Completed Date"] <= both["Delivery Date"]).sum())
             k = st.columns(4)
@@ -1184,39 +1467,51 @@ with t_ex:
             kpi(k[3], "দেশ", f"{ok['Country'].nunique()}", "", 3)
             if len(ok):
                 cy = ok.groupby("Country", as_index=False)["Required Pcs"].sum().sort_values("Required Pcs")
-                show(px.bar(cy, x="Required Pcs", y="Country", orientation="h",
-                            title="দেশ অনুযায়ী Completed (Pcs)", color_discrete_sequence=["#34D399"]), 420)
-                sec_title("Completed তালিকা")
-                t = ok.sort_values("Completed Date")[["Country", "Product Name", "Order No", "Required Pcs",
-                                                      "Batch Number", "Completed Date", "Delivery Date"]].copy()
-                t["Late (দিন)"] = (ok.loc[t.index, "Completed Date"] - ok.loc[t.index, "Delivery Date"]).dt.days
-                t["Completed Date"], t["Delivery Date"] = dfmt(t["Completed Date"]), dfmt(t["Delivery Date"])
-                t["Required Pcs"] = t["Required Pcs"].map(fmt_full)
-                st.dataframe(t, hide_index=True)
-                st.caption("Late (দিন): মাইনাস বা ০ = সময়মতো/আগে, প্লাস = Delivery Date-এর পরে হয়েছে।")
+                show(px.bar(cy, x="Required Pcs", y="Country", orientation="h", title="দেশ অনুযায়ী Completed (Pcs)",
+                            color="Country", color_discrete_map=cmap), 420)
+            sec_title("Completed তালিকা (ফাইলের সব কলাম)")
+            cols = ["Country", "Product Name", "SAP Code", "Order No", "Machine", "Pack Size", "Pcs per Box",
+                    "Required Box", "Required Pcs", "Batch Size", "Batches Req", "Batch Number", "Status",
+                    "Order Date", "Completed Date", "Delivery Date", "Late (দিন)", "Remarks"]
+            t = prep_ex(c.sort_values("Completed Date"), cols)
+            cdf(style_ex(t, cmap), hide_index=True)
+            st.caption("Late (দিন): মাইনাস বা ০ = সময়মতো/আগে, প্লাস/লাল = Delivery Date-এর পরে হয়েছে। "
+                       "Remarks-এ ফাইলের শেষের নোট/Available কলামগুলো আছে।")
+            st.download_button("⬇️ এই তালিকা CSV", csv_bytes(t), "completed_export_orders.csv", mime="text/csv")
 
-        else:
+        elif view_ex.startswith("Demand"):
             dm = E[E["Source"] == "Demand"].copy()
             sheets = list(dict.fromkeys(dm["Sheet"]))
             if not sheets:
                 st.info("Demand শিট পাওয়া যায়নি।")
             else:
-                sh_pick = st.selectbox("মাস", sheets, key="ex_dm")
+                sh_pick = st.selectbox("Demand শিট", sheets, key="ex_dm")
                 m_ = dm[dm["Sheet"] == sh_pick].copy()
                 unit = m_["Pack Size"].iloc[0]
                 col = "Required Pcs" if unit == "Pcs" else "Required Box"
                 k = st.columns(3)
                 kpi(k[0], "অর্ডার লাইন", f"{len(m_)}", f"{m_['Country'].nunique()}টা দেশ", 0)
-                kpi(k[1], f"মোট ({unit})", fmt_full(m_[col].sum()), "এই মাসের Demand", 1)
-                kpi(k[2], "Batch নিতে বাকি", f"{(m_['Status'].fillna('').str.lower().str.contains('need to take')).sum()}", "", 2)
+                kpi(k[1], f"মোট ({unit})", fmt_full(m_[col].sum()), sh_pick, 1)
+                kpi(k[2], "Batch নিতে বাকি", f"{(m_['Group'] == 'Batch need to take').sum()}", "", 2)
                 cy = m_.groupby("Country", as_index=False)[col].sum().sort_values(col)
                 show(px.bar(cy, x=col, y="Country", orientation="h", title=f"দেশ অনুযায়ী Demand ({unit})",
-                            color_discrete_sequence=["#FFB020"]), 400)
-                t = m_.sort_values("Delivery Date")[["Country", "Product Name", "Order No", col, "Status",
-                                                     "Order Date", "Delivery Date"]].copy()
-                t[col] = t[col].map(fmt_full)
-                t["Order Date"], t["Delivery Date"] = dfmt(t["Order Date"]), dfmt(t["Delivery Date"])
-                st.dataframe(t, hide_index=True)
+                            color="Country", color_discrete_map=cmap), 400)
+                sec_title("Demand তালিকা (ফাইলের সব কলাম)")
+                cols = ["Country", "Product Name", "SAP Code", "Order No", col, "Status", "Order Date",
+                        "Delivery Date", "SO Aging", "Remarks"]
+                t = prep_ex(m_.sort_values("Delivery Date"), cols)
+                cdf(style_ex(t, cmap), hide_index=True)
+
+        else:
+            if not RAW:
+                st.info("মূল শিটের ডেটা পাওয়া যায়নি। Export ফাইলটা আবার আপলোড করুন।")
+            else:
+                sh = st.selectbox("শিট বেছে নিন", list(RAW), key="ex_raw")
+                g = RAW[sh]
+                st.caption(f"{sh}: {len(g)} সারি · {len(g.columns)} কলাম — ফাইলে যেমন আছে তেমন (A, B, C… = Excel কলাম)। "
+                           "হলুদ = দেশ, সবুজ = Total, নীল = হেডার।")
+                cdf(raw_style(g), hide_index=True, height=560)
+                st.download_button("⬇️ এই শিট CSV", csv_bytes(g), f"{sh}.csv", mime="text/csv")
 
 # =====================================================================
 # শুধু Admin: নতুন এন্ট্রি ও ডেটা
@@ -1263,7 +1558,7 @@ if is_admin:
 
         sec_title("হাতে দেওয়া এন্ট্রি")
         man = st.session_state.manual
-        st.dataframe(man, hide_index=True)
+        cdf(man, hide_index=True)
         mb = io.BytesIO()
         mx = man.copy()
         mx["Date"] = pd.to_datetime(mx["Date"], errors="coerce").dt.date
@@ -1297,13 +1592,13 @@ if is_admin:
         st.download_button("⬇️ monthly_targets.json", json.dumps(st.session_state.mt_raw, ensure_ascii=False, indent=1).encode("utf-8"),
                            MT_FILE.name, mime="application/json")
         with st.expander("Production ডেটা"):
-            st.dataframe(prod[PROD_COLS], hide_index=True)
+            cdf(prod[PROD_COLS], hide_index=True)
         with st.expander("Daily Target ডেটা"):
-            st.dataframe(tgt[TARGET_COLS], hide_index=True)
+            cdf(tgt[TARGET_COLS], hide_index=True)
         with st.expander("Batch Release ডেটা"):
-            st.dataframe(bat[BATCH_COLS], hide_index=True)
+            cdf(bat[BATCH_COLS], hide_index=True)
         with st.expander("Export Order ডেটা"):
-            st.dataframe(D.get("exp", pd.DataFrame(columns=EXPORT_COLS)), hide_index=True)
+            cdf(D.get("exp", pd.DataFrame(columns=EXPORT_COLS)), hide_index=True)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as xw:
             for name, frame, cols in (("Production", prod, PROD_COLS), ("Daily Target", tgt, TARGET_COLS),
