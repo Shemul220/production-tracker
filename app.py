@@ -29,8 +29,6 @@ BATCH_COLS = ["Date", "Product Name", "Batch No", "Type"]
 # মাসিক Target (মাস → সংখ্যা)। এখানে দেওয়া মান ডিফল্ট; সাইট থেকে বদলালে data/monthly_targets.json-এ সেভ হয়।
 DEFAULT_MONTHLY_TARGETS = {"2026-11": 17830000}  # নভেম্বর'26 = 1,78,30,000
 MT_FILE = DATA_DIR / "monthly_targets.json"
-# ভুল মান → সঠিক মান (মাস: (ভুল, ঠিক))। নভেম্বর'26: 17,83,00,000 নয়, হবে 1,78,30,000
-TARGET_FIXES = {"2026-11": (178300000, 17830000)}
 
 # লগবুক ফাইলের কলামের অবস্থান (০ থেকে গোনা)। নতুন কলাম লাগলে এখানে যোগ করুন।
 SECONDARY_MAP = {0: "Date", 1: "Day", 2: "Shift", 3: "Shift Owner", 4: "Line", 5: "Code",
@@ -102,8 +100,12 @@ def parse_production(wb):
         r = tuple(r) + (None,) * (32 - len(r))
         rec = {name: r[i] for i, name in mp.items()}
         prod = txt(rec["Product Name"])
+        code = txt(rec["Code"])
         if prod is None or prod.startswith("#"):
-            continue
+            # Excel-এর নামের lookup ব্যর্থ (#N/A) হলেও Code/Output থাকলে সারিটা রাখা হয়; একদম ফাঁকা সারি বাদ
+            if code is None and not num(rec.get("Output")):
+                continue
+            prod = f"(নাম নেই) {code}" if code else "(নাম নেই)"
         rec["Stage"] = stage
         rec["Date"] = to_date(rec["Date"])
         rec["Product Name"] = prod
@@ -413,6 +415,11 @@ def load_files(files):
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=cols)
 
     P, T, B = cat(prod, PROD_COLS).drop_duplicates(), cat(tgt, TARGET_COLS), cat(bat, BATCH_COLS)
+    if len(P):  # নাম না পাওয়া Code-এর নাম অন্য সারি থেকে পাওয়া গেলে বসিয়ে দেওয়া
+        known = P[~P["Product Name"].fillna("").str.startswith("(নাম নেই)")].dropna(subset=["Code"])
+        name_of = known.groupby("Code")["Product Name"].agg(lambda s: s.value_counts().index[0]).to_dict()
+        miss = P["Product Name"].fillna("").str.startswith("(নাম নেই)")
+        P.loc[miss, "Product Name"] = [name_of.get(c, n) for c, n in zip(P.loc[miss, "Code"], P.loc[miss, "Product Name"])]
     T = T.drop_duplicates("Date", keep="last") if len(T) else T
     B = B.drop_duplicates(["Date", "Batch No", "Product Name"]) if len(B) else B
     # একাধিক Export ফাইল থাকলে সবচেয়ে শেষেরটা (নতুন আপলোড) নেওয়া হয়, যাতে পুরনো/নতুন ভার্সন দ্বিগুণ না হয়
@@ -940,10 +947,6 @@ if "mt_raw" not in st.session_state:
             raw.update({str(k): int(v) for k, v in json.loads(MT_FILE.read_text("utf-8")).items()})
     except Exception:  # noqa: BLE001
         pass
-    # ভুল করে বসানো পুরনো মান (যেমন নভেম্বর'26-এ 17,83,00,000) নিজে থেকে ঠিক মানে বদলে যাবে
-    for _m, (_bad, _good) in TARGET_FIXES.items():
-        if raw.get(_m) == _bad:
-            raw[_m] = _good
     st.session_state.mt_raw = raw
 MT = {k: v for k, v in st.session_state.mt_raw.items() if v and v > 0}  # মাস → মাসিক Target
 
@@ -1619,6 +1622,11 @@ if is_admin:
         kpi(k[1], "Target দিন", f"{len(tgt):,}", "", 1)
         kpi(k[2], "Batch সারি", f"{len(bat):,}", "", 2)
         kpi(k[3], "Export Order সারি", f"{len(D.get('exp', [])):,}", "", 3)
+        miss_n = prod["Product Name"].astype(str).str.startswith("(নাম নেই)")
+        if miss_n.any():
+            st.warning(f"⚠️ {int(miss_n.sum())}টা সারিতে প্রোডাক্টের নাম নেই (Excel-এর Product List-এ ওই Code নেই), "
+                       f"মোট {fmt_full(prod.loc[miss_n, 'Output'].sum())} Output। সারিগুলো হিসাবে ধরা আছে। "
+                       "Excel-এ Code-টা যোগ করে ফাইল আবার দিলে নাম চলে আসবে।")
         st.caption("মাসিক Target: " + (", ".join(f"{m} = {fmt_full(v)}" for m, v in sorted(MT.items())) or "কিছু সেট করা নেই"))
         st.download_button("⬇️ monthly_targets.json", json.dumps(st.session_state.mt_raw, ensure_ascii=False, indent=1).encode("utf-8"),
                            MT_FILE.name, mime="application/json")
