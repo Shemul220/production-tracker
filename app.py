@@ -27,7 +27,7 @@ TARGET_COLS = ["Date", "Daily Target", "Daily Output"]
 BATCH_COLS = ["Date", "Product Name", "Batch No", "Type"]
 
 # মাসিক Target (মাস → সংখ্যা)। এখানে দেওয়া মান ডিফল্ট; সাইট থেকে বদলালে data/monthly_targets.json-এ সেভ হয়।
-DEFAULT_MONTHLY_TARGETS = {"2026-11": 17830000}  # নভেম্বর'26 = 1,78,30,000
+DEFAULT_MONTHLY_TARGETS = {"2026-11": 178300000}  # নভেম্বর'26 = 17,83,00,000 (সতেরো কোটি তিরাশি লাখ)
 MT_FILE = DATA_DIR / "monthly_targets.json"
 
 # লগবুক ফাইলের কলামের অবস্থান (০ থেকে গোনা)। নতুন কলাম লাগলে এখানে যোগ করুন।
@@ -828,6 +828,68 @@ def gh_put(path, data, message):
         raise RuntimeError(f"GitHub {r.status_code}: {r.json().get('message', '')}")
 
 
+def file_family(name):
+    """একই ধরনের ফাইলের চাবি: নামের তারিখ (22_11_26), (1), copy বাদ দিয়ে বাকি অক্ষর।"""
+    s = re.sub(r"\.[^.]+$", "", name).lower()
+    if "export" in s and "order" in s:  # Export Order ফাইলের নাম তারিখ সহ বদলালেও একই ধরন
+        return "exportorderstatus"
+    s = re.sub(r"\(\d+\)|[-_ ]copy", "", s)
+    s = re.sub(r"\d{1,2}[_.\-/ ]\d{1,2}[_.\-/ ]\d{2,4}", "", s)
+    return re.sub(r"[^a-z0-9\u0980-\u09ff]+", "", s)
+
+
+def name_date(name):
+    """ফাইলের নামের শেষ তারিখ (dd_mm_yy) — না থাকলে None।"""
+    m = re.findall(r"(\d{1,2})[_.\-](\d{1,2})[_.\-](\d{2,4})", name)
+    if not m:
+        return None
+    dd, mm, yy = (int(x) for x in m[-1])
+    try:
+        return date(yy + 2000 if yy < 100 else yy, mm, dd)
+    except ValueError:
+        return None
+
+
+def pick_latest(repo_entries, upload_entries):
+    """একই ধরনের একাধিক ফাইল থাকলে শুধু নতুনটা: সাইডবারের আপলোড > নামের তারিখ বেশি > নামের ক্রম।"""
+    chosen = {}
+    for n, d in sorted(repo_entries, key=lambda e: (name_date(e[0]) or date.min, e[0])):
+        chosen[file_family(n)] = (n, d)
+    for n, d in upload_entries:
+        chosen[file_family(n)] = (n, d)
+    return tuple(chosen.values())
+
+
+def gh_replace_old(new_name):
+    """নতুন ফাইল সেভের পর GitHub data ফোল্ডার থেকে একই ধরনের পুরনো ফাইল মুছে দেয়। মোছা ফাইলের নাম ফেরত দেয়।"""
+    branch = GH.get("branch", "main")
+    hdr = {"Authorization": f"Bearer {GH['token']}", "Accept": "application/vnd.github+json"}
+    base = f"https://api.github.com/repos/{GH['repo']}/contents"
+    r = requests.get(f"{base}/data", headers=hdr, params={"ref": branch}, timeout=30)
+    if r.status_code != 200:
+        return []
+    fam, removed = file_family(new_name), []
+    for it in r.json():
+        n = it.get("name", "")
+        if (it.get("type") != "file" or n == new_name or not n.lower().endswith(".xlsx")
+                or n == MANUAL_FILE.name or file_family(n) != fam):
+            continue
+        d = requests.delete(f"{base}/{quote(it['path'])}", headers=hdr, timeout=60,
+                            json={"message": f"Replace {n} with {new_name}", "sha": it["sha"], "branch": branch})
+        if d.status_code < 300:
+            removed.append(n)
+    return removed
+
+
+def gh_save_upload(name, data):
+    """ফাইল GitHub-এ সেভ করে, তারপর একই ধরনের পুরনো ফাইল সরায়।"""
+    gh_put(f"data/{name}", data, f"Add {name}")
+    try:
+        return gh_replace_old(name)
+    except Exception:  # noqa: BLE001
+        return []
+
+
 # =====================================================================
 # সাইডবার ও ডেটা লোড
 # =====================================================================
@@ -888,19 +950,21 @@ with st.sidebar:
             for up in uploads:
                 if (up.name, up.size) not in saved:
                     try:
-                        gh_put(f"data/{up.name}", up.getvalue(), f"Add {up.name}")
-                        saved[(up.name, up.size)] = True
+                        saved[(up.name, up.size)] = gh_save_upload(up.name, up.getvalue())
                     except Exception as e:  # noqa: BLE001
                         st.error(f"{up.name}: {e}")
             if saved:
                 st.caption("✅ সেভ হয়েছে: " + ", ".join(n for n, _ in saved))
+                for (n_, _), rem in saved.items():
+                    if rem:
+                        st.caption(f"♻️ {n_}: পুরনো ফাইলের জায়গায় বসেছে → " + ", ".join(rem))
         elif uploads:
             if gh_ready():
                 if st.button("💾 স্থায়ীভাবে সেভ করুন"):
                     done, bad = [], []
                     for up in uploads:
                         try:
-                            gh_put(f"data/{up.name}", up.getvalue(), f"Add {up.name}")
+                            gh_save_upload(up.name, up.getvalue())
                             done.append(up.name)
                         except Exception as e:  # noqa: BLE001
                             bad.append(f"{up.name}: {e}")
@@ -917,7 +981,7 @@ repo_paths = [p for p in sorted(DATA_DIR.iterdir())  # .xlsx আর .XLSX দু
               and p.name != MANUAL_FILE.name] if DATA_DIR.exists() else []
 if DEFAULT_FILE.exists():
     repo_paths.append(DEFAULT_FILE)
-files = tuple([(p.name, p.read_bytes()) for p in repo_paths] + [(u.name, u.getvalue()) for u in uploads])
+files = pick_latest([(p.name, p.read_bytes()) for p in repo_paths], [(u.name, u.getvalue()) for u in uploads])
 
 key = tuple((n, len(d)) for n, d in files)
 if st.session_state.get("files_key") != key:
