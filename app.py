@@ -1,7 +1,10 @@
 import base64
+import hashlib
 import hmac
 import io
 import json
+import math
+import os
 import re
 from urllib.parse import quote
 from datetime import date, datetime, time, timedelta
@@ -696,6 +699,43 @@ div[data-testid="stForm"] {border: 1px solid rgba(90,140,230,.30); border-radius
 """, unsafe_allow_html=True)
 
 
+def _full_number_axes(fig):
+    """বড় সংখ্যার অক্ষে 80M/6M-এর বদলে পূর্ণ সংখ্যা (15,00,000), আর হোভারেও পূর্ণ সংখ্যা।"""
+    try:
+        vals, stacked = [], fig.layout.barmode == "stack"
+        horiz = False
+        for tr in fig.data:
+            if tr.type not in ("bar", "scatter"):
+                return
+            v = tr.x if getattr(tr, "orientation", None) == "h" else tr.y
+            horiz = horiz or getattr(tr, "orientation", None) == "h"
+            if v is None or len(v) == 0 or isinstance(v[0], str):
+                return
+            vals.append([float(a) if a is not None and not pd.isna(a) else 0.0 for a in v])
+        if not vals:
+            return
+        if stacked:
+            mx = max(sum(c) for c in zip(*vals)) if len({len(v) for v in vals}) == 1 else max(max(v) for v in vals)
+        else:
+            mx = max(max(v) for v in vals)
+        if mx < 10000:  # ঘণ্টা, শতাংশ ইত্যাদি ছোট সংখ্যায় হাত দেওয়া হবে না
+            return
+        raw = mx / 4
+        mag = 10 ** math.floor(math.log10(raw))
+        step = next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw)
+        ticks = [step * i for i in range(int(mx // step) + 2)]
+        upd = fig.update_xaxes if horiz else fig.update_yaxes
+        upd(tickvals=ticks, ticktext=[fmt_full(t) for t in ticks])
+        for tr in fig.data:
+            if getattr(tr, "customdata", None) is None:
+                v = tr.x if getattr(tr, "orientation", None) == "h" else tr.y
+                tr.customdata = [fmt_full(a) for a in v]
+                lab = "%{y}" if horiz else "%{x}"
+                tr.hovertemplate = lab + "<br>%{fullData.name}: %{customdata}<extra></extra>"
+    except Exception:  # noqa: BLE001
+        return
+
+
 def style(fig, h=370):
     fig.update_layout(height=h, margin=dict(l=10, r=10, t=48, b=10), paper_bgcolor="rgba(0,0,0,0)",
                       plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#D6E2F7", size=12), colorway=PALETTE,
@@ -705,6 +745,7 @@ def style(fig, h=370):
     fig.update_yaxes(gridcolor="rgba(120,160,230,.16)", zeroline=False, linecolor="rgba(120,160,230,.35)",
                      automargin=True)
     fig.update_layout(bargap=0.3)
+    _full_number_axes(fig)
     for tr in fig.data:  # "2026-11" বা "2026-W45" লেখাকে তারিখ ভেবে ভুল করা ঠেকায়
         x = getattr(tr, "x", None)
         if x is not None and len(x) and isinstance(x[0], str) and re.match(r"^\d{4}-(W?\d{2})$", x[0]):
@@ -762,54 +803,7 @@ def hero(sub, chips=()):
 
 
 # =====================================================================
-# Login (ID / Password): Streamlit Secrets থেকে নেয়
-# =====================================================================
-def get_secret(section):
-    try:
-        return dict(st.secrets[section])
-    except Exception:  # noqa: BLE001
-        return None
-
-
-ADMIN, VIEWER, GH = get_secret("admin"), get_secret("viewer"), get_secret("github")
-LOGIN_ON = bool(ADMIN or VIEWER)
-
-
-def same(a, b):
-    return hmac.compare_digest(str(a).encode(), str(b).encode())
-
-
-def try_login(u, p):
-    for role, acc in (("admin", ADMIN), ("viewer", VIEWER)):
-        if acc and acc.get("password") and same(u.strip(), acc.get("username", "")) and same(p, acc["password"]):
-            return role
-    return None
-
-
-if not LOGIN_ON:
-    st.session_state.role = "admin"  # Secrets না দেওয়া পর্যন্ত সবার জন্য খোলা
-if "role" not in st.session_state:
-    hero("Primary &amp; Secondary Packaging · Daily Target · Batch Release")
-    mid = st.columns([1, 2, 1])[1]
-    with mid:
-        with st.form("login"):
-            st.markdown("#### 🔐 Login")
-            u = st.text_input("Username")
-            p = st.text_input("Password", type="password")
-            if st.form_submit_button("Login"):
-                r = try_login(u, p)
-                if r:
-                    st.session_state.role = r
-                    st.rerun()
-                else:
-                    st.error("Username বা Password ভুল।")
-    st.stop()
-
-is_admin = st.session_state.role == "admin"
-
-
-# =====================================================================
-# GitHub-এ স্থায়ীভাবে সেভ
+# GitHub helper (লগইনের ইউজার তালিকাও এখানে সেভ হয়)
 # =====================================================================
 def gh_ready():
     return bool(GH and GH.get("token") and GH.get("repo"))
@@ -828,6 +822,191 @@ def gh_put(path, data, message):
         raise RuntimeError(f"GitHub {r.status_code}: {r.json().get('message', '')}")
 
 
+
+def gh_get(path):
+    """GitHub থেকে ফাইলের আসল কনটেন্ট (ডিপ্লয়ের অপেক্ষা ছাড়াই)। ফাইল না থাকলে None।"""
+    url = f"https://api.github.com/repos/{GH['repo']}/contents/{quote(path)}"
+    hdr = {"Authorization": f"Bearer {GH['token']}", "Accept": "application/vnd.github+json"}
+    r = requests.get(url, headers=hdr, params={"ref": GH.get("branch", "main")}, timeout=30)
+    if r.status_code == 404:
+        return None
+    if r.status_code >= 300:
+        raise RuntimeError(f"GitHub {r.status_code}: {r.json().get('message', '')}")
+    return base64.b64decode(r.json()["content"])
+
+
+# =====================================================================
+# Login: Secrets-এর admin/viewer + নিজে খোলা অ্যাকাউন্ট (Admin অনুমোদন দিলে চালু)
+# =====================================================================
+def get_secret(section):
+    try:
+        return dict(st.secrets[section])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+ADMIN, VIEWER, GH = get_secret("admin"), get_secret("viewer"), get_secret("github")
+LOGIN_ON = bool(ADMIN or VIEWER)
+USERS_FILE = "data/users.json"
+USER_RE = re.compile(r"^[a-z0-9_.\-]{3,30}$")
+MIN_PW = 6
+
+
+def same(a, b):
+    return hmac.compare_digest(str(a).encode(), str(b).encode())
+
+
+def try_login(u, p):
+    for role, acc in (("admin", ADMIN), ("viewer", VIEWER)):
+        if acc and acc.get("password") and same(u.strip(), acc.get("username", "")) and same(p, acc["password"]):
+            return role
+    return None
+
+
+def hash_pw(pw, salt=None):
+    salt = salt or os.urandom(16).hex()
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000).hex()
+    return f"{salt}${dk}"
+
+
+def check_pw(pw, stored):
+    try:
+        salt, dk = stored.split("$")
+    except ValueError:
+        return False
+    return same(hash_pw(pw, salt).split("$")[1], dk)
+
+
+def load_users():
+    raw = gh_get(USERS_FILE)
+    return json.loads(raw.decode("utf-8")) if raw else {}
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_users_cached():
+    return load_users()
+
+
+def save_users(users, msg="Update users"):
+    gh_put(USERS_FILE, json.dumps(users, ensure_ascii=False, indent=1).encode("utf-8"), msg)
+    load_users_cached.clear()
+
+
+def reserved_names():
+    return {str(a.get("username", "")).strip().lower() for a in (ADMIN, VIEWER) if a}
+
+
+def do_login(u, p):
+    """(role, username, error) ফেরত দেয়।"""
+    r = try_login(u, p)
+    if r:
+        return r, u.strip(), None
+    bad = "Username বা Password ভুল।"
+    if not gh_ready():
+        return None, None, bad
+    try:
+        rec = load_users().get(u.strip().lower())
+    except Exception as e:  # noqa: BLE001
+        return None, None, f"এখন ইউজার তালিকা পড়া যাচ্ছে না: {e}"
+    if not rec or not check_pw(p, rec.get("pw", "")):
+        return None, None, bad
+    if rec.get("status") == "pending":
+        return None, None, "⏳ আপনার অ্যাকাউন্ট এখনো Admin-এর অনুমোদনের অপেক্ষায় আছে।"
+    if rec.get("status") != "approved":
+        return None, None, "❌ এই অ্যাকাউন্ট এখন বন্ধ আছে। Admin-এর সাথে যোগাযোগ করুন।"
+    return "viewer", u.strip().lower(), "reg"
+
+
+def do_signup(name, u, p, p2):
+    u = u.strip().lower()
+    if not name.strip():
+        return "আপনার নাম/পদবি লিখুন, যাতে Admin চিনতে পারেন।"
+    if not USER_RE.match(u):
+        return "Username ৩-৩০ অক্ষরের হতে হবে: শুধু ইংরেজি ছোট অক্ষর, সংখ্যা, _ . -"
+    if len(p) < MIN_PW:
+        return f"Password কমপক্ষে {MIN_PW} অক্ষরের দিন।"
+    if p != p2:
+        return "দুইবার দেওয়া Password মিলছে না।"
+    if u in reserved_names():
+        return "এই Username নেওয়া যাবে না, অন্যটা দিন।"
+    try:
+        users = load_users()
+        if u in users:
+            return "এই Username আগে থেকেই আছে, অন্যটা দিন।"
+        users[u] = {"name": name.strip(), "pw": hash_pw(p), "status": "pending",
+                    "role": "viewer",
+                    "created": datetime.now().isoformat(timespec="seconds")}
+        save_users(users, f"Signup request: {u}")
+    except Exception as e:  # noqa: BLE001
+        return f"সেভ করা যায়নি: {e}"
+    return None
+
+
+if not LOGIN_ON:
+    st.session_state.role = "admin"  # Secrets না দেওয়া পর্যন্ত সবার জন্য খোলা
+if "role" not in st.session_state:
+    hero("Primary &amp; Secondary Packaging · Daily Target · Batch Release")
+    mid = st.columns([1, 2, 1])[1]
+    with mid:
+        tl, ts = st.tabs(["🔐 Login", "📝 নতুন অ্যাকাউন্ট খুলুন"])
+        with tl:
+            if st.session_state.get("fails", 0) >= 5:
+                st.error("অনেকবার ভুল হয়েছে। পেজ রিফ্রেশ করে আবার চেষ্টা করুন।")
+            else:
+                with st.form("login"):
+                    u = st.text_input("Username")
+                    p = st.text_input("Password", type="password")
+                    if st.form_submit_button("Login"):
+                        r, who, kind = do_login(u, p)
+                        if r:
+                            st.session_state.role = r
+                            st.session_state.username = who
+                            st.session_state.owner = kind != "reg" and r == "admin"
+                            if kind == "reg":
+                                st.session_state.reg_user = who
+                            st.session_state.fails = 0
+                            st.rerun()
+                        else:
+                            if kind and "ভুল" in kind:
+                                st.session_state.fails = st.session_state.get("fails", 0) + 1
+                            st.error(kind)
+        with ts:
+            if not gh_ready():
+                st.info("নতুন অ্যাকাউন্ট খোলার সুবিধা এখনো চালু নেই। Admin-এর সাথে যোগাযোগ করুন।")
+            else:
+                st.caption("ফর্ম পাঠালে Admin অনুমোদন দেওয়ার পর আপনি Login করতে পারবেন।")
+                with st.form("signup", clear_on_submit=True):
+                    nm = st.text_input("আপনার নাম ও পদবি")
+                    ru = st.text_input("Username (ইংরেজি ছোট অক্ষর/সংখ্যা)")
+                    rp = st.text_input(f"Password (কমপক্ষে {MIN_PW} অক্ষর)", type="password")
+                    rp2 = st.text_input("Password আবার দিন", type="password")
+                    st.caption("এই অ্যাকাউন্টে শুধু চার্ট ও ডেটা দেখা যাবে (Viewer)।")
+                    if st.form_submit_button("অনুমোদনের জন্য পাঠান"):
+                        err = do_signup(nm, ru, rp, rp2)
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success("✅ আবেদন গেছে। Admin অনুমোদন দিলে এই Username-Password দিয়ে Login করুন।")
+    st.stop()
+
+is_admin = st.session_state.role == "admin"
+is_owner = bool(st.session_state.get("owner")) or not LOGIN_ON
+
+# নিজে খোলা অ্যাকাউন্ট মুছে দিলে বা বাতিল হলে চলতি সেশনও বন্ধ
+if st.session_state.get("reg_user") and gh_ready():
+    try:
+        _rec = load_users_cached().get(st.session_state.reg_user)
+    except Exception:  # noqa: BLE001
+        _rec = {"status": "approved", "role": st.session_state.role}
+    if not _rec or _rec.get("status") != "approved":
+        for k_ in ("role", "username", "reg_user", "owner"):
+            st.session_state.pop(k_, None)
+        st.rerun()
+
+
+# =====================================================================
+# GitHub-এ স্থায়ীভাবে সেভ
+# =====================================================================
 def file_family(name):
     """একই ধরনের ফাইলের চাবি: নামের তারিখ (22_11_26), (1), copy বাদ দিয়ে বাকি অক্ষর।"""
     s = re.sub(r"\.[^.]+$", "", name).lower()
@@ -933,10 +1112,31 @@ uploads = []
 with st.sidebar:
     st.markdown("### 🏭 BSU Tracker")
     if LOGIN_ON:
-        st.caption("Login: " + ("Admin" if is_admin else "Viewer"))
+        st.caption(f"👤 {st.session_state.get('username', '')} · " + ("Admin" if is_admin else "Viewer"))
         if st.button("Logout"):
-            st.session_state.pop("role", None)
+            for k_ in ("role", "username", "reg_user", "owner"):
+                st.session_state.pop(k_, None)
             st.rerun()
+        if st.session_state.get("reg_user"):
+            with st.expander("🔑 Password বদলান"):
+                with st.form("chpw", clear_on_submit=True):
+                    op = st.text_input("এখনকার Password", type="password")
+                    np1 = st.text_input("নতুন Password", type="password")
+                    np2 = st.text_input("নতুন Password আবার", type="password")
+                    if st.form_submit_button("বদলান"):
+                        try:
+                            us = load_users()
+                            me = us.get(st.session_state.reg_user)
+                            if not me or not check_pw(op, me["pw"]):
+                                st.error("এখনকার Password ভুল।")
+                            elif len(np1) < MIN_PW or np1 != np2:
+                                st.error(f"নতুন Password কমপক্ষে {MIN_PW} অক্ষর ও দুইবার একই হতে হবে।")
+                            else:
+                                me["pw"] = hash_pw(np1)
+                                save_users(us, f"Password change: {st.session_state.reg_user}")
+                                st.success("Password বদলে গেছে।")
+                        except Exception as e:  # noqa: BLE001
+                            st.error(str(e))
     else:
         st.warning("Login চালু নেই। Streamlit Secrets-এ admin/viewer দিলে চালু হবে।")
     if is_admin:
@@ -1028,8 +1228,14 @@ if fl:
 st.toggle("🖱️ চার্ট জুম/মুভ চালু করুন (স্ক্রল করার সময় বন্ধ রাখুন)", key="chart_edit")
 st.toggle("🎨 রঙিন টেবিল (বোল্ড হেডার)", value=True, key="color_tbl")
 labels = ["📊 Production", "📋 Daily Report", "🎯 Target vs Output", "📦 Batch Release", "🚢 Export Order"]
+_pend_n = 0
 if is_admin:
-    labels += ["➕ নতুন এন্ট্রি", "🗂️ ডেটা"]
+    if gh_ready():
+        try:
+            _pend_n = sum(1 for v in load_users_cached().values() if v.get("status") == "pending")
+        except Exception:  # noqa: BLE001
+            _pend_n = 0
+    labels += ["➕ নতুন এন্ট্রি", "🗂️ ডেটা", "👥 ইউজার" + (f" 🔴{_pend_n}" if _pend_n else "")]
 tabs = st.tabs(labels)
 t1, t_dr, t2, t3, t_ex = tabs[0], tabs[1], tabs[2], tabs[3], tabs[4]
 
@@ -1713,3 +1919,65 @@ if is_admin:
             ex_.to_excel(xw, sheet_name="Export Orders", index=False)
         st.download_button("⬇️ সব ডেটা Excel (ব্যাকআপ)", buf.getvalue(), "all_data.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # -----------------------------------------------------------------
+    # ইউজার অনুমোদন ও ব্যবস্থাপনা
+    # -----------------------------------------------------------------
+    with tabs[7]:
+        sec_title("ইউজার ও অনুমতি")
+        if not gh_ready():
+            st.warning("ইউজার তালিকা রাখতে Streamlit Secrets-এ [github] token ও repo লাগবে।")
+        else:
+            try:
+                users = load_users_cached()  # ১৫ সেকেন্ড মনে রাখে: প্রতি ক্লিকে GitHub ডাকা লাগে না
+            except Exception as e:  # noqa: BLE001
+                users = None
+                st.error(f"ইউজার তালিকা পড়া যায়নি: {e}")
+            if users is not None:
+                def _save(msg, note):
+                    try:
+                        save_users(users, msg)
+                        st.session_state.flash = ("ok", note)
+                    except Exception as e:  # noqa: BLE001
+                        st.session_state.flash = ("err", f"সেভ হয়নি: {e}")
+                    st.rerun()
+
+                if st.button("🔄 তালিকা রিফ্রেশ"):
+                    load_users_cached.clear()
+                    st.rerun()
+                pend = {k: v for k, v in users.items() if v.get("status") == "pending"}
+                st.markdown(f"#### ⏳ অনুমোদনের অপেক্ষায় ({len(pend)})")
+                if not pend:
+                    st.caption("এখন কোনো নতুন আবেদন নেই।")
+                for k, v in pend.items():
+                    with st.container(border=True):
+                        st.markdown(f"**{v.get('name') or k}** · `{k}` · {str(v.get('created', ''))[:10]}")
+                        c2, c3 = st.columns(2)
+                        if c2.button("✅ Approve (Viewer)", key=f"ok_{k}"):
+                            users[k].update(status="approved", role="viewer")
+                            _save(f"Approve {k}", f"✅ {k} অনুমোদিত। এখন Login করতে পারবে।")
+                        if c3.button("❌ Reject", key=f"no_{k}"):
+                            users[k]["status"] = "rejected"
+                            _save(f"Reject {k}", f"{k}-এর আবেদন বাতিল করা হয়েছে।")
+
+                others = {k: v for k, v in users.items() if v.get("status") != "pending"}
+                st.markdown(f"#### 👥 অন্যান্য ইউজার ({len(others)})")
+                if others:
+                    tbl = pd.DataFrame([{"Username": k, "নাম": v.get("name", ""),
+                                         "অবস্থা": "চালু" if v.get("status") == "approved" else "বন্ধ/বাতিল",
+                                         "তারিখ": str(v.get("created", ""))[:10]} for k, v in others.items()])
+                    st.dataframe(tbl, hide_index=True, use_container_width=True)
+                    sel = st.selectbox("ইউজার বেছে নিন", list(others), key="usr_sel")
+                    on = users[sel].get("status") == "approved"
+                    a1, a2 = st.columns(2)
+                    new_pw = a1.text_input("নতুন Password দিন (ভুলে গেলে)", type="password", key="usr_pw")
+                    if a1.button("🔑 Password বদলান", disabled=len(new_pw) < MIN_PW):
+                        users[sel]["pw"] = hash_pw(new_pw)
+                        _save(f"Reset password {sel}", f"{sel}-এর Password বদলানো হয়েছে।")
+                    if a2.button("⏸️ বন্ধ (Disable) করুন" if on else "▶️ আবার চালু করুন"):
+                        users[sel]["status"] = "rejected" if on else "approved"
+                        _save(f"Toggle {sel}", f"{sel} এখন {'বন্ধ' if on else 'চালু'}।")
+                    if a2.button("🗑️ অ্যাকাউন্ট মুছুন"):
+                        users.pop(sel)
+                        _save(f"Delete {sel}", f"{sel} মুছে ফেলা হয়েছে।")
+                st.caption("Secrets-এর মূল admin/viewer অ্যাকাউন্ট আগের মতোই চলবে, সেগুলো এখানে দেখাবে না।")
