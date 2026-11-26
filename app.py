@@ -381,9 +381,128 @@ def status_group(s):
     return "Other" if t else "Unknown"
 
 
+EXPORT_DONE_COLS = ["Sheet", "Order No", "Complete Date", "Country", "Batch No", "Product Name", "MFG", "EXP",
+                    "Qty Pcs", "Remarks", "Date Note"]
+
+
+DONE_COUNTRY_FIX = {"kenya": "Kenya", "azerbaizan": "Azerbaijan", "hoduras": "Honduras", "hongkong": "Hong Kong",
+                    "laopdr": "Lao PDR", "srilanka": "Sri Lanka", "srilankatender": "Sri Lanka (Tender)",
+                    "somalia": "Somalia"}
+
+
+def clean_country_done(v):
+    """একই দেশের নানা বানান (Hoduras, HongKong, SOMALIA…) এক নামে আনা।"""
+    s = re.sub(r"\s+", " ", txt(v) or "").strip()
+    if not s:
+        return None
+    key = re.sub(r"[\s()\-]", "", s.lower())
+    if key in DONE_COUNTRY_FIX:
+        return DONE_COUNTRY_FIX[key]
+    return s.title() if s.isupper() else s
+
+
+def _done_cols(hdr):
+    """হেডার লেখা দেখে কোন কলামে কী আছে বের করে (শিটভেদে কলামের সংখ্যা আলাদা)।"""
+    m = {}
+    for i, h in enumerate(hdr):
+        if not h:
+            continue
+        if "export country" in h or h == "country":
+            m.setdefault("country", i)
+        elif "batch" in h:
+            m.setdefault("batch", i)
+        elif "product" in h:
+            m.setdefault("prod", i)
+        elif "order" in h:
+            m.setdefault("order", i)
+        elif h.startswith("mfg"):
+            m.setdefault("mfg", i)
+        elif h.startswith("exp"):
+            m.setdefault("exp", i)
+        elif "quantity" in h or "qty" in h:
+            m.setdefault("qty", i)
+        elif "date" in h:
+            m.setdefault("date", i)
+        elif "remark" in h:
+            m.setdefault("rem", i)
+    return m
+
+
+def is_export_done_wb(wb):
+    """Export Complete Batch ফাইল কিনা: কোনো শিটের হেডারে 'Export Country' আর 'Batch Number' আছে।"""
+    for ws in wb.worksheets:
+        for r in ws.iter_rows(min_row=1, max_row=6, max_col=14, values_only=True):
+            low = [str(c).strip().lower() for c in r if c is not None]
+            if any("export country" in c for c in low) and any("batch" in c for c in low):
+                return True
+    return False
+
+
+def parse_export_done(wb):
+    """Export Complete Batch ফাইলের সব শিট: প্রতি সারি = একটা Complete ব্যাচ (Total সারি বাদ)।"""
+    recs = []
+    for ws in wb.worksheets:
+        title = (ws.title or "").strip()
+        rows = list(ws.iter_rows(min_row=1, max_row=1500, max_col=14, values_only=True))
+        rows = [tuple(r) + (None,) * (14 - len(r)) for r in rows]
+        hi = next((j for j, r in enumerate(rows[:8])
+                   if any("export country" in str(c or "").lower() for c in r)
+                   and any("batch" in str(c or "").lower() for c in r)), None)
+        if hi is None:
+            continue
+        m = _done_cols([str(c).strip().lower() if c is not None else "" for c in rows[hi]])
+        if not all(k in m for k in ("country", "batch", "qty")):
+            continue
+        for r in rows[hi + 1:]:
+            batch, qty = txt(r[m["batch"]]), num(r[m["qty"]])
+            if batch is None or qty is None:
+                continue
+            recs.append({
+                "Sheet": title, "Order No": _note(r[m["order"]]) if "order" in m else None,
+                "Complete Date": _dt(r[m["date"]]) if "date" in m else None,
+                "Country": clean_country_done(r[m["country"]]), "Batch No": batch,
+                "Product Name": txt(r[m["prod"]]) if "prod" in m else None,
+                "MFG": _note(r[m["mfg"]]) if "mfg" in m else None,
+                "EXP": _note(r[m["exp"]]) if "exp" in m else None,
+                "Qty Pcs": qty, "Remarks": _note(r[m["rem"]]) if "rem" in m else None, "Date Note": None})
+    # Excel-এ তারিখ টেনে নামানোর ভুলে বছর বদলে যায় (যেমন 2025 শিটে 2027-01-15): শিটের বেশিরভাগ বছরের সাথে মিলিয়ে ঠিক করা
+    from collections import Counter
+    for sh in {r["Sheet"] for r in recs}:
+        yrs = Counter(r["Complete Date"].year for r in recs if r["Sheet"] == sh and r["Complete Date"])
+        if not yrs:
+            continue
+        my = yrs.most_common(1)[0][0]
+        for r in recs:
+            if r["Sheet"] == sh and r["Complete Date"] and r["Complete Date"].year != my:
+                old = r["Complete Date"]
+                try:
+                    r["Complete Date"] = old.replace(year=my)
+                    r["Date Note"] = f"ফাইলে ছিল {old:%d.%m.%Y}, {my} ধরা হয়েছে"
+                except ValueError:
+                    pass
+    return recs
+
+
+def done_prepare(df):
+    """Export Complete Batch ডেটা তৈরি: তারিখ/সংখ্যা ঠিক করা, মাস বের করা, দুই শিটে থাকা ডুপ্লিকেট চিহ্নিত করা।"""
+    d = df.reindex(columns=EXPORT_DONE_COLS).copy()
+    d["Complete Date"] = pd.to_datetime(d["Complete Date"], errors="coerce")
+    d["Qty Pcs"] = pd.to_numeric(d["Qty Pcs"], errors="coerce")
+    d["Country"] = d["Country"].fillna("-").astype(str)
+    d["Month"] = d["Complete Date"].dt.strftime("%Y-%m").fillna("-")
+    rank = {s: i for i, s in enumerate(dict.fromkeys(d["Sheet"]))}      # শিটের ক্রম: পরের শিট = নতুন
+    d["_rank"] = d["Sheet"].map(rank)
+    key = (d["Product Name"].fillna("").str.lower().str.replace(r"\s+", " ", regex=True) + "|"
+           + d["Qty Pcs"].astype(str) + "|" + d["Complete Date"].astype(str))
+    d["Duplicate"] = d["_rank"] < d.groupby(key)["_rank"].transform("max")   # একই সারি নতুন শিটেও আছে
+    fut = d["Complete Date"] > pd.Timestamp(date.today())
+    d.loc[fut & d["Date Note"].isna(), "Date Note"] = "আজকের পরের তারিখ, ঠিক আছে কিনা দেখুন"
+    return d
+
+
 @st.cache_data(show_spinner="ফাইল পড়া হচ্ছে...")
 def load_files(files):
-    prod, tgt, bat, exp, expraw, errors = [], [], [], [], [], []
+    prod, tgt, bat, exp, expraw, expdone, errors = [], [], [], [], [], [], []
     for name, data in files:
         try:
             wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
@@ -396,10 +515,15 @@ def load_files(files):
                     bat.append(x.parse("Batch Release").reindex(columns=BATCH_COLS))
                 if "Export Orders" in x.sheet_names:
                     exp.append(x.parse("Export Orders").reindex(columns=EXPORT_COLS))
+                if "Export Complete" in x.sheet_names:
+                    expdone.append(x.parse("Export Complete").reindex(columns=EXPORT_DONE_COLS))
                 continue
             if any(n.strip().lower().startswith("current export order") for n in wb.sheetnames):
                 exp.append(pd.DataFrame(parse_export(wb), columns=EXPORT_COLS))  # Export Order Status ফাইল
                 expraw.append(parse_export_raw(wb))
+                continue
+            if is_export_done_wb(wb):  # Export Complete Batch ফাইল (Export Order থেকে আলাদা)
+                expdone.append(pd.DataFrame(parse_export_done(wb), columns=EXPORT_DONE_COLS))
                 continue
             t = parse_targets(wb)
             if t:
@@ -427,7 +551,8 @@ def load_files(files):
     B = B.drop_duplicates(["Date", "Batch No", "Product Name"]) if len(B) else B
     # একাধিক Export ফাইল থাকলে সবচেয়ে শেষেরটা (নতুন আপলোড) নেওয়া হয়, যাতে পুরনো/নতুন ভার্সন দ্বিগুণ না হয়
     X = exp[-1] if exp else pd.DataFrame(columns=EXPORT_COLS)
-    return {"prod": P, "tgt": T, "bat": B, "exp": X, "expraw": (expraw[-1] if expraw else {})}, errors
+    XD = expdone[-1] if expdone else pd.DataFrame(columns=EXPORT_DONE_COLS)
+    return {"prod": P, "tgt": T, "bat": B, "exp": X, "expraw": (expraw[-1] if expraw else {}), "expdone": XD}, errors
 
 
 # ---------- হিসাব ----------
@@ -1673,11 +1798,91 @@ def raw_style(df):
     return [("map", cell_css, list(df.columns)), ("rows", row_css, None)]
 
 
+def render_export_done(XD):
+    """📦 Export Complete Batch ভিউ: Export Order ফাইল থেকে সম্পূর্ণ আলাদা, ডেটা মেশে না।"""
+    d = done_prepare(XD)
+    st.caption("📦 Export Complete Batch ফাইল — Export Order ফাইল থেকে আলাদা; এই ভিউর ডেটা ওই ডেটার সাথে মেশে না।")
+    c1, c2, c3 = st.columns(3)
+    f_sheet = c1.multiselect("শিট (ফাঁকা = সব)", list(dict.fromkeys(d["Sheet"])), key="xd_sheet")
+    f_month = c2.multiselect("মাস (ফাঁকা = সব)", sorted(m for m in d["Month"].unique() if m != "-"), key="xd_month")
+    f_ctry = c3.multiselect("দেশ (ফাঁকা = সব)", sorted(d["Country"].unique()), key="xd_ctry")
+    f_prod = st.multiselect("Product (ফাঁকা = সব)", sorted(d["Product Name"].dropna().unique()), key="xd_prod")
+    q = st.text_input("🔍 Batch / Order / Product খুঁজুন", key="xd_q")
+    drop_dup = st.checkbox("একই ব্যাচ দুই শিটে থাকলে একবার গোনা (ডুপ্লিকেট বাদ)", value=True, key="xd_dedupe")
+    r = d
+    if f_sheet:
+        r = r[r["Sheet"].isin(f_sheet)]
+    if f_month:
+        r = r[r["Month"].isin(f_month)]
+    if f_ctry:
+        r = r[r["Country"].isin(f_ctry)]
+    if f_prod:
+        r = r[r["Product Name"].isin(f_prod)]
+    if q.strip():
+        ql = q.strip().lower()
+        r = r[r["Batch No"].fillna("").str.lower().str.contains(ql, regex=False)
+              | r["Order No"].fillna("").str.lower().str.contains(ql, regex=False)
+              | r["Product Name"].fillna("").str.lower().str.contains(ql, regex=False)]
+    dup_n = int(r["Duplicate"].sum())
+    dup_pcs = r.loc[r["Duplicate"], "Qty Pcs"].sum()
+    if drop_dup:
+        r = r[~r["Duplicate"]]
+    k = st.columns(4)
+    kpi(k[0], "Complete ব্যাচ", f"{len(r):,}", f"{dup_n}টা ডুপ্লিকেট বাদ" if drop_dup else f"{dup_n}টা ডুপ্লিকেট সহ", 0)
+    kpi(k[1], "মোট (Pcs)", fmt_full(r["Qty Pcs"].sum()), f"ডুপ্লিকেট {fmt_full(dup_pcs)} Pcs" if dup_n else "", 1)
+    kpi(k[2], "দেশ", f"{r['Country'].nunique()}", "", 2)
+    kpi(k[3], "Product", f"{r['Product Name'].nunique()}", "", 3)
+    if r.empty:
+        st.info("এই ফিল্টারে কোনো ডেটা নেই।")
+        return
+    cmap_d = {c_: COUNTRY_COLORS[i % len(COUNTRY_COLORS)] for i, c_ in enumerate(sorted(d["Country"].unique()))}
+    sec_title("মাস, দেশ ও Product অনুযায়ী")
+    mo = r[r["Month"] != "-"].groupby("Month", as_index=False)["Qty Pcs"].sum()
+    if len(mo):
+        show(px.bar(mo, x="Month", y="Qty Pcs", title="মাস অনুযায়ী Complete (Pcs)",
+                    color_discrete_sequence=["#3B82F6"]), 360)
+    c1, c2 = st.columns(2)
+    with c1:
+        cy = r.groupby("Country", as_index=False)["Qty Pcs"].sum().sort_values("Qty Pcs")
+        show(px.bar(cy, x="Qty Pcs", y="Country", orientation="h", title="দেশ অনুযায়ী (Pcs)",
+                    color="Country", color_discrete_map=cmap_d), 460)
+    with c2:
+        tp = (r.groupby("Product Name", as_index=False)["Qty Pcs"].sum().sort_values("Qty Pcs").tail(10))
+        show(px.bar(tp, x="Qty Pcs", y="Product Name", orientation="h", title="সবচেয়ে বেশি ১০টা Product (Pcs)",
+                    color_discrete_sequence=["#34D399"]), 460)
+    sec_title("Complete ব্যাচের তালিকা (ফাইলের সব কলাম)")
+    cols = ["Complete Date", "Country", "Product Name", "Batch No", "Order No", "Qty Pcs", "MFG", "EXP",
+            "Remarks", "Sheet", "Date Note"] + ([] if drop_dup else ["Duplicate"])
+    t = r.sort_values(["Complete Date", "Batch No"], ascending=False)[cols].copy()
+    t["Complete Date"] = t["Complete Date"].dt.strftime("%d %b %Y").fillna("-")
+    t["Qty Pcs"] = t["Qty Pcs"].map(fmt_full)
+    if "Duplicate" in t:
+        t["Duplicate"] = t["Duplicate"].map({True: "ডুপ্লিকেট", False: "-"})
+    t = t.fillna("-").astype(str)
+    ov = [("map", lambda v: "background-color:#fde68a;color:#78350f;font-weight:700" if v != "-" else "", ["Date Note"]),
+          ("map", lambda v: "background-color:#fecaca;color:#7f1d1d;font-weight:700" if v == "ডুপ্লিকেট" else "", ["Duplicate"]),
+          ("map", lambda v: "font-weight:700", ["Product Name", "Qty Pcs"])]
+    show_all = st.checkbox("সব সারি দেখান (রং ছাড়া সাধারণ টেবিল, সর্ট করা যাবে)", key="xd_all")
+    if show_all or len(t) <= 400:
+        cdf(t, extra=ov, hide_index=True)
+    else:
+        cdf(t.head(400), extra=ov, hide_index=True)
+        st.caption(f"সবচেয়ে নতুন ৪০০টা সারি দেখানো হচ্ছে (মোট {len(t):,}টা)। ফিল্টার দিন, অথবা 'সব সারি দেখান' টিক দিন, অথবা CSV নামান।")
+    st.caption("Date Note: ফাইলে তারিখের বছর ভুল থাকলে (Excel-এ টেনে নামানোর কারণে) শিটের বছর অনুযায়ী ঠিক করা হয়েছে; "
+               "আজকের পরের তারিখও এখানে চিহ্নিত। ডুপ্লিকেট = একই Product, পরিমাণ ও তারিখ নতুন শিটেও আছে।")
+    st.download_button("⬇️ এই তালিকা CSV", csv_bytes(t), "export_complete_batch.csv", mime="text/csv")
+
+
 with t_ex:
     E = D.get("exp")
+    XD = D.get("expdone")
+    XD = XD if XD is not None else pd.DataFrame(columns=EXPORT_DONE_COLS)
     RAW = D.get("expraw") or {}
     if E is None or E.empty:
         st.info("Export Order Status ফাইলটা (Current Export Order Status শিটসহ) আপলোড করুন।")
+        if len(XD):
+            sec_title("📦 Export Complete Batch")
+            render_export_done(XD)
     else:
         E = E.reindex(columns=EXPORT_COLS).copy()
         for c_ in ("Order Date", "Completed Date", "Delivery Date"):
@@ -1707,8 +1912,8 @@ with t_ex:
                     t[c] = t[c].fillna("-").astype(str)
             return t
 
-        view_ex = st.radio("দেখুন", ["Open Orders", "Completed", "Demand (আসছে অর্ডার)", "সব শিট (মূল ফাইল)"],
-                           horizontal=True, key="ex_view")
+        view_ex = st.radio("দেখুন", ["Open Orders", "Completed", "Demand (আসছে অর্ডার)", "সব শিট (মূল ফাইল)",
+                                    "📦 Export Complete Batch"], horizontal=True, key="ex_view")
 
         if view_ex == "Open Orders":
             o_all = E[E["Source"] == "Open"].copy()
@@ -1761,6 +1966,29 @@ with t_ex:
         elif view_ex == "Completed":
             c = E[E["Source"] == "Completed"].copy()
             c["Late (দিন)"] = (c["Completed Date"] - c["Delivery Date"]).dt.days
+            # ---- ফিল্টার (কিছু বাছাই না করলে সব দেখায়) ----
+            c["Month"] = c["Completed Date"].dt.strftime("%Y-%m").fillna("-")
+            f1, f2, f3 = st.columns(3)
+            fc_ = f1.multiselect("দেশ (ফাঁকা = সব)", sorted(c["Country"].unique()), key="exc_c")
+            fs_ = f2.multiselect("Status (ফাঁকা = সব)", sorted(c["Group"].unique()), key="exc_s")
+            fm_ = f3.multiselect("Completed মাস (ফাঁকা = সব)", sorted(m for m in c["Month"].unique() if m != "-"), key="exc_m")
+            fq_ = st.text_input("🔍 Product / Order No / Batch No খুঁজুন", key="exc_q")
+            ft_ = st.radio("সময়", ["সব", "সময়মতো", "দেরি হয়েছে"], horizontal=True, key="exc_t")
+            if fc_:
+                c = c[c["Country"].isin(fc_)]
+            if fs_:
+                c = c[c["Group"].isin(fs_)]
+            if fm_:
+                c = c[c["Month"].isin(fm_)]
+            if fq_.strip():
+                ql_ = fq_.strip().lower()
+                c = c[c["Product Name"].fillna("").str.lower().str.contains(ql_, regex=False)
+                      | c["Order No"].fillna("").str.lower().str.contains(ql_, regex=False)
+                      | c["Batch Number"].fillna("").str.lower().str.contains(ql_, regex=False)]
+            if ft_ == "সময়মতো":
+                c = c[c["Late (দিন)"] <= 0]
+            elif ft_ == "দেরি হয়েছে":
+                c = c[c["Late (দিন)"] > 0]
             ok = c[c["Group"] == "Completed"]
             both = ok[ok["Completed Date"].notna() & ok["Delivery Date"].notna()]
             on_time = int((both["Completed Date"] <= both["Delivery Date"]).sum())
@@ -1805,6 +2033,12 @@ with t_ex:
                         "Delivery Date", "SO Aging", "Remarks"]
                 t = prep_ex(m_.sort_values("Delivery Date"), cols)
                 cdf(t, extra=style_ex(t, cmap), hide_index=True)
+
+        elif view_ex.startswith("📦"):
+            if XD.empty:
+                st.info("Export Complete Batch ফাইলটা (Export Packing শিটসহ) সাইডবার থেকে আপলোড করুন।")
+            else:
+                render_export_done(XD)
 
         else:
             if not RAW:
@@ -1908,6 +2142,8 @@ if is_admin:
             cdf(bat[BATCH_COLS], hide_index=True)
         with st.expander("Export Order ডেটা"):
             cdf(D.get("exp", pd.DataFrame(columns=EXPORT_COLS)), hide_index=True)
+        with st.expander("Export Complete Batch ডেটা"):
+            cdf(D.get("expdone", pd.DataFrame(columns=EXPORT_DONE_COLS)), hide_index=True)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as xw:
             for name, frame, cols in (("Production", prod, PROD_COLS), ("Daily Target", tgt, TARGET_COLS),
@@ -1917,6 +2153,8 @@ if is_admin:
                 f.to_excel(xw, sheet_name=name, index=False)
             ex_ = D.get("exp", pd.DataFrame(columns=EXPORT_COLS)).reindex(columns=EXPORT_COLS)
             ex_.to_excel(xw, sheet_name="Export Orders", index=False)
+            xd_ = D.get("expdone", pd.DataFrame(columns=EXPORT_DONE_COLS)).reindex(columns=EXPORT_DONE_COLS)
+            xd_.to_excel(xw, sheet_name="Export Complete", index=False)
         st.download_button("⬇️ সব ডেটা Excel (ব্যাকআপ)", buf.getvalue(), "all_data.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
