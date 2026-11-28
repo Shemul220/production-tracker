@@ -12,5 +12,12 @@
   "status": "approved",
   "role": "viewer",
   "created": "2026-11-25T11:15:34"
+ },
+ "rahim": {
+  "name": "Rahim",
+  "pw": "bfb2362ebd0dae999d5497266b5098eb$8e2b0cea44e40f8647f1b0be5b2bd625241d84b1135a6f83b71acd92454acc94",
+  "status": "pending",
+  "role": "viewer",
+  "created": "2026-11-28T11:30:46"
  }
 }
